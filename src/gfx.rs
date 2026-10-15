@@ -364,6 +364,7 @@ pub mod glyph {
     pub const CLOSE: &str = "\u{E894}";
     pub const CHECK: &str = "\u{E73E}";
     pub const PALETTE: &str = "\u{E790}";
+    pub const SEARCH: &str = "\u{E721}";
 }
 
 /// Single-line text formats (no wrapping, ellipsis on overflow), sized for one DPI scale.
@@ -542,9 +543,15 @@ impl<'a> Canvas<'a> {
         let wide: Vec<u16> = s.encode_utf16().collect();
         let mut metrics = DWRITE_TEXT_METRICS::default();
         unsafe {
-            match self.fonts.dwrite.CreateTextLayout(&wide, self.fonts.get(font), f32::MAX, f32::MAX) {
-                Ok(layout) if layout.GetMetrics(&mut metrics).is_ok() => metrics.widthIncludingTrailingWhitespace / self.scale,
-                _ => 0.0,
+            let Ok(layout) = self.fonts.dwrite.CreateTextLayout(&wide, self.fonts.get(font), f32::MAX, f32::MAX) else {
+                return 0.0;
+            };
+            // The format is shared, so it carries whatever alignment `text` last drew with;
+            // centred or trailing in an f32::MAX-wide box, the width is lost to rounding.
+            let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            match layout.GetMetrics(&mut metrics) {
+                Ok(()) => metrics.widthIncludingTrailingWhitespace / self.scale,
+                Err(_) => 0.0,
             }
         }
     }

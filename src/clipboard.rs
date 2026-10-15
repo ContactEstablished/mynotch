@@ -117,11 +117,7 @@ impl Watcher {
                 return false;
             }
             match content {
-                Content::Text(s) => {
-                    let wide: Vec<u16> = s.encode_utf16().chain([0]).collect();
-                    let bytes = std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2);
-                    set_data(u32::from(CF_UNICODETEXT.0), bytes)
-                }
+                Content::Text(s) => set_text(s),
                 Content::Image { dib, .. } => set_data(u32::from(CF_DIB.0), dib),
             }
         }
@@ -135,6 +131,40 @@ impl Drop for Watcher {
             let _ = DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// The clipboard's text, or `None` if it has none, it's too big, or the clipboard is busy.
+/// Not filtered for private copies: the user is pasting into our own field.
+pub fn read_text(owner: HWND) -> Option<String> {
+    let _open = OpenGuard::new(owner)?;
+    unsafe {
+        IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)).ok()?;
+        read_global(u32::from(CF_UNICODETEXT.0), MAX_TEXT * 2).map(|bytes| utf16_text(&bytes))
+    }
+}
+
+/// Puts `text` on the clipboard, owned by `owner` (it must be a real window: with no owner,
+/// `SetClipboardData` fails after `EmptyClipboard`). Returns whether it worked. The history
+/// widget picks it up like any other copy.
+pub fn write_text(owner: HWND, text: &str) -> bool {
+    let Some(_open) = OpenGuard::new(owner) else { return false };
+    unsafe { EmptyClipboard().is_ok() && set_text(text) }
+}
+
+/// Puts `s` on the open clipboard as CF_UNICODETEXT.
+unsafe fn set_text(s: &str) -> bool {
+    let wide: Vec<u16> = s.encode_utf16().chain([0]).collect();
+    unsafe {
+        let bytes = std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2);
+        set_data(u32::from(CF_UNICODETEXT.0), bytes)
+    }
+}
+
+/// CF_UNICODETEXT bytes (UTF-16LE) as a string, up to the first NUL.
+fn utf16_text(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
 }
 
 /// Copies `bytes` into a movable global block and hands it to the open clipboard.
@@ -212,10 +242,7 @@ fn capture(hwnd: HWND) -> Option<Content> {
             return None;
         }
         if IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)).is_ok() {
-            let bytes = read_global(u32::from(CF_UNICODETEXT.0), MAX_TEXT * 2)?;
-            let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
-            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-            let text = String::from_utf16_lossy(&units[..end]);
+            let text = utf16_text(&read_global(u32::from(CF_UNICODETEXT.0), MAX_TEXT * 2)?);
             return (!text.trim().is_empty()).then_some(Content::Text(text));
         }
         if IsClipboardFormatAvailable(u32::from(CF_DIB.0)).is_ok() {
@@ -315,7 +342,7 @@ pub fn preview(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dib_to_bgra, is_link, preview};
+    use super::{dib_to_bgra, is_link, preview, utf16_text};
 
     fn header(width: i32, height: i32, bpp: u16, compression: u32) -> Vec<u8> {
         let mut h = vec![0u8; 40];
@@ -363,5 +390,12 @@ mod tests {
         assert!(!is_link("see https://example.com"));
         assert_eq!(preview("  fn main() {\n    println!(\"hi\");\n}  ", 100), "fn main() { println!(\"hi\"); }");
         assert_eq!(preview("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn utf16_text_stops_at_the_first_nul() {
+        let bytes = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert_eq!(utf16_text(&bytes("hi\0junk")), "hi");
+        assert_eq!(utf16_text(&bytes("héllo 😀")), "héllo 😀", "no NUL: the whole buffer");
     }
 }

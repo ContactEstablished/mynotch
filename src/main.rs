@@ -11,6 +11,7 @@ mod media;
 mod settings;
 mod settings_panel;
 mod stats;
+mod text;
 mod timer;
 mod widgets;
 

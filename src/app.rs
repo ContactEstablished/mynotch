@@ -15,7 +15,10 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::*,
-            Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON, VK_RBUTTON},
+            Input::KeyboardAndMouse::{
+                GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_F4,
+                VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT,
+            },
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
                 Shell_NotifyIconW,
@@ -26,11 +29,13 @@ use windows::{
     core::*,
 };
 
+use crate::clipboard;
 use crate::desktop::{self, autostart};
 use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Look, Rect, glyph};
 use crate::icon;
 use crate::settings::Settings;
 use crate::settings_panel::{self, Hit};
+use crate::text::{self, Command, TextField, Utf16Joiner};
 use crate::widgets::{self, Compact, Widget};
 
 const TIMER_FRAME: usize = 1;
@@ -73,6 +78,10 @@ const CARD_PAD: f32 = 14.0;
 const CARD_RADIUS: f32 = 16.0;
 /// A slide that ends this close to the middle of the screen snaps to it.
 const SNAP: f32 = 12.0;
+/// Longest search query, in chars.
+const SEARCH_MAX: usize = 100;
+/// Room for the magnifier at the left of the open search field.
+const FIELD_ICON: f32 = 32.0;
 
 /// Tab 0 is the Home dashboard; widget `i` is tab `i + 1`; the Settings tab is last, on the
 /// right (see `settings_tab`).
@@ -115,11 +124,34 @@ fn tab_named(widgets: &[Box<dyn Widget>], title: &str) -> Option<usize> {
     (0..=widgets.len()).find(|&t| tab_title(widgets, t) == title)
 }
 
-/// The empty stretch of the tab row between the widget tabs and the Settings tab. Dragging
-/// it slides the notch along the top of the screen.
-fn handle_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+/// The empty stretch of the tab row between the widget tabs and the Settings tab.
+fn stretch_rect(widgets: &[Box<dyn Widget>]) -> Rect {
     let x = tab_rect(widgets, widgets.len()).right() + TAB_GAP;
     Rect::new(x, 0.0, tab_rect(widgets, settings_tab(widgets)).x - TAB_GAP - x, TAB_BASE)
+}
+
+/// The magnifier button at the stretch's right end, shaped like a tab. It opens search.
+fn search_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+    Rect::new(stretch_rect(widgets).right() - TAB_W, TAB_Y, TAB_W, TAB_H)
+}
+
+/// While searching, the whole stretch is the search field.
+fn field_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+    let s = stretch_rect(widgets);
+    Rect::new(s.x, TAB_Y, s.w, TAB_H)
+}
+
+/// Where the search field's text goes, right of its magnifier.
+fn field_text_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+    let f = field_rect(widgets);
+    Rect::new(f.x + FIELD_ICON, f.y, f.w - FIELD_ICON - 10.0, f.h)
+}
+
+/// The stretch left of the magnifier. Dragging it slides the notch along the top of the
+/// screen.
+fn handle_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+    let s = stretch_rect(widgets);
+    Rect::new(s.x, 0.0, search_rect(widgets).x - TAB_GAP - s.x, TAB_BASE)
 }
 
 /// Home dashboard cards as (widget index, rect in content coordinates), sized by weight.
@@ -307,6 +339,23 @@ enum Modal {
     PickColor,
 }
 
+/// Who holds the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// The tab-row search field.
+    Search,
+}
+
+/// Keyboard focus the notch took after an explicit user action; see `begin_typing`.
+struct Keyboard {
+    owner: Owner,
+    /// The window that had the foreground before, to give it back to.
+    restore: Option<HWND>,
+    /// Caret visibility, toggled at the system blink rate; solid right after each edit.
+    caret_on: bool,
+    blink_at: Instant,
+}
+
 struct App {
     hwnd: HWND,
     d2d: ID2D1Factory,
@@ -339,6 +388,12 @@ struct App {
     /// False while the window is click-through (`WS_EX_TRANSPARENT`), i.e. the cursor is
     /// not over the notch body.
     interactive: bool,
+    /// Set while the notch holds the keyboard; see `begin_typing` / `end_typing`.
+    keyboard: Option<Keyboard>,
+    /// The search field, while search is open.
+    search: Option<TextField>,
+    /// Pairs UTF-16 surrogates from WM_CHAR.
+    joiner: Utf16Joiner,
     dirty: bool,
 }
 
@@ -437,6 +492,9 @@ impl App {
                 modal_open: false,
                 drag: None,
                 interactive: true,
+                keyboard: None,
+                search: None,
+                joiner: Utf16Joiner::default(),
                 dirty: true,
             })
         }
@@ -525,7 +583,168 @@ impl App {
     /// Whether the cursor is over the open notch's slide handle.
     fn over_handle(&self) -> bool {
         let (x, y) = self.cursor_logical();
-        self.t >= 0.9 && handle_rect(&self.widgets).contains(x, y)
+        self.t >= 0.9 && self.search.is_none() && handle_rect(&self.widgets).contains(x, y)
+    }
+
+    /// Whether the cursor is over the open search field.
+    fn over_field(&self) -> bool {
+        let (x, y) = self.cursor_logical();
+        self.t >= 0.9 && self.search.is_some() && field_rect(&self.widgets).contains(x, y)
+    }
+
+    /// Takes keyboard focus for `owner`. Only call straight from an explicit user action: a
+    /// click on the notch (so this process received the last input event, which lets it take
+    /// the foreground). Returns false, holding nothing, if the notch didn't become the
+    /// foreground window.
+    fn begin_typing(&mut self, owner: Owner) -> bool {
+        let fg = unsafe { GetForegroundWindow() };
+        let restore = match &self.keyboard {
+            Some(kb) => kb.restore,
+            None => (!fg.is_invalid() && fg != self.hwnd).then_some(fg),
+        };
+        let blink_at = Instant::now() + caret_blink().unwrap_or_default();
+        // All state is in place before taking the foreground: the activation messages that
+        // sends re-enter `wndproc` while `APP` is borrowed, and `with_app` drops them.
+        self.keyboard = Some(Keyboard { owner, restore, caret_on: true, blink_at });
+        self.joiner = Utf16Joiner::default();
+        self.dirty = true;
+        unsafe {
+            // WS_EX_NOACTIVATE stops clicks activating the window, not this.
+            let _ = SetForegroundWindow(self.hwnd);
+            if GetForegroundWindow() != self.hwnd {
+                self.keyboard = None;
+                return false;
+            }
+            let _ = SetFocus(Some(self.hwnd));
+        }
+        true
+    }
+
+    /// Gives the keyboard up. `restore` hands the foreground back to the window that had it
+    /// (Esc, a tab click); `false` leaves it where it's going (a click elsewhere).
+    fn end_typing(&mut self, restore: bool) {
+        let Some(kb) = self.keyboard.take() else { return };
+        match kb.owner {
+            Owner::Search => self.search = None,
+        }
+        self.joiner = Utf16Joiner::default();
+        self.dirty = true;
+        // Only now, with typing over: the notch's resulting deactivation is dropped by
+        // `with_app`, which is harmless because there's nothing left to end.
+        if restore
+            && let Some(prev) = kb.restore
+            && unsafe { IsWindow(Some(prev)) }.as_bool()
+        {
+            unsafe {
+                let _ = SetForegroundWindow(prev);
+            }
+        }
+    }
+
+    /// Opens the tab-row search with an empty query and takes the keyboard.
+    fn open_search(&mut self) {
+        self.search = Some(TextField::new(SEARCH_MAX));
+        if !self.begin_typing(Owner::Search) {
+            self.search = None;
+        }
+        self.dirty = true;
+    }
+
+    /// After an edit or a caret move: show the caret solid, and redraw.
+    fn edited(&mut self) {
+        if let Some(kb) = &mut self.keyboard {
+            kb.caret_on = true;
+            kb.blink_at = Instant::now() + caret_blink().unwrap_or_default();
+        }
+        self.dirty = true;
+    }
+
+    /// A click in the search field, at expanded-layout x: moves the caret there (Shift
+    /// extends the selection).
+    fn place_caret(&mut self, x: f32) {
+        let r = field_text_rect(&self.widgets);
+        let Some(field) = &self.search else { return };
+        // Measuring needs only the fonts and the scale.
+        let cv = Canvas::new(&self.rt, &self.brushes, &self.layout.fonts, &self.images, self.layout.scale, (0.0, 0.0), None);
+        let at = text::caret_at(&cv, field, r, Font::Body, x);
+        if let Some(field) = &mut self.search {
+            field.set_caret(at, key_down(VK_SHIFT));
+        }
+        self.edited();
+    }
+
+    /// A key went down while the notch may hold the keyboard. Returns whether it was used;
+    /// if not, it goes on to `DefWindowProcW`.
+    fn on_key(&mut self, vk: u16, sys: bool) -> bool {
+        let Some(owner) = self.keyboard.as_ref().map(|kb| kb.owner) else { return false };
+        if sys {
+            // DefWindowProcW would turn Alt+F4 into closing MyNotch: treat it as Esc instead.
+            if vk == VK_F4.0 {
+                self.end_typing(true);
+                return true;
+            }
+            return false;
+        }
+        // AltGr arrives as Ctrl+Alt and types characters on many layouts, so a Ctrl+Alt
+        // chord is never an editing command.
+        let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
+        let shift = key_down(VK_SHIFT);
+        match owner {
+            Owner::Search => {
+                let Some(command) = text::command(vk, ctrl, shift) else { return false };
+                self.search_command(command);
+            }
+        }
+        true
+    }
+
+    fn search_command(&mut self, command: Command) {
+        let hwnd = self.hwnd;
+        let Some(field) = &mut self.search else { return };
+        match command {
+            Command::Move(motion, extend) => field.move_caret(motion, extend),
+            Command::Backspace(word) => field.backspace(word),
+            Command::Delete(word) => field.delete(word),
+            Command::SelectAll => field.select_all(),
+            Command::Copy => {
+                if !field.selected().is_empty() {
+                    clipboard::write_text(hwnd, field.selected());
+                }
+            }
+            // Only remove the text once it's safely on the clipboard.
+            Command::Cut => {
+                if !field.selected().is_empty() && clipboard::write_text(hwnd, field.selected()) {
+                    field.cut();
+                }
+            }
+            Command::Paste => {
+                if let Some(s) = clipboard::read_text(hwnd) {
+                    field.insert(&s);
+                }
+            }
+            Command::Submit => {}
+            Command::Cancel => {
+                self.end_typing(true);
+                return;
+            }
+        }
+        self.edited();
+    }
+
+    /// A typed UTF-16 unit. While the notch holds the keyboard, every char is ours.
+    fn on_char(&mut self, unit: u16) -> bool {
+        let Some(owner) = self.keyboard.as_ref().map(|kb| kb.owner) else { return false };
+        if let Some(c) = self.joiner.push(unit) {
+            match owner {
+                Owner::Search => {
+                    if let Some(field) = &mut self.search {
+                        field.insert(c.encode_utf8(&mut [0; 4]));
+                    }
+                }
+            }
+            self.edited();
+        }
+        true
     }
 
     /// The collapsed readout, and the index of the widget providing it.
@@ -566,6 +785,20 @@ impl App {
         }
         if self.peek_until.is_some_and(|until| now >= until) {
             self.peek_until = None;
+        }
+
+        // Typing needs the foreground. If it moved without our hearing (a deactivation that
+        // `with_app` dropped while `APP` was busy), stop typing and leave it where it went.
+        if self.keyboard.is_some() && unsafe { GetForegroundWindow() } != self.hwnd {
+            self.end_typing(false);
+        }
+        if let Some(kb) = &mut self.keyboard
+            && let Some(period) = caret_blink()
+            && now >= kb.blink_at
+        {
+            kb.caret_on = !kb.caret_on;
+            kb.blink_at = now + period;
+            self.dirty = true;
         }
 
         // The notch is never the foreground window, so its mouse capture only sees the
@@ -639,7 +872,9 @@ impl App {
         }
 
         let peeking = self.peek_until.is_some();
-        let target = if hovered || self.settings.pinned || self.modal_open || peeking { 1.0 } else { 0.0 };
+        // Holding the keyboard keeps it open: it can't collapse out from under the typing.
+        let typing = self.keyboard.is_some();
+        let target = if hovered || self.settings.pinned || self.modal_open || peeking || typing { 1.0 } else { 0.0 };
         if target > self.target && self.t < 0.5 {
             // Opening from collapsed: Home if that's where the user left it (it shows the live
             // activity anyway); else live activity (music, a running timer) takes the stage;
@@ -672,7 +907,16 @@ impl App {
         if PIN.contains(lx, ly) {
             self.toggle_pin();
         } else if let Some(t) = (0..tab_count(&self.widgets)).find(|&t| tab_rect(&self.widgets, t).contains(lx, ly)) {
+            // Picking a tab while searching closes search and gives the focus back.
+            self.end_typing(true);
             self.select_tab(t);
+        } else if self.search.is_some() {
+            // While searching, only the field itself takes clicks: they place the caret.
+            if field_rect(&self.widgets).contains(lx, ly) {
+                self.place_caret(lx);
+            }
+        } else if search_rect(&self.widgets).contains(lx, ly) {
+            self.open_search();
         } else if handle_rect(&self.widgets).contains(lx, ly) {
             // Where the press happened, on screen (the cursor may have moved on since).
             let from_x = self.placement().x + x;
@@ -843,7 +1087,10 @@ impl App {
                 self.draw_tabs(&cv);
 
                 let content = cv.offset(CONTENT.x, CONTENT.y);
-                if self.active == HOME {
+                if self.search.is_some() {
+                    let all = Rect::new(0.0, 0.0, CONTENT.w, CONTENT.h);
+                    content.text("Type to search apps", Font::Body, Ink::Dim, all, Align::Center);
+                } else if self.active == HOME {
                     for (i, r) in home_cards(&self.widgets) {
                         content.fill(r, CARD_RADIUS, Ink::Track);
                         let inner = content.offset(r.x + CARD_PAD, r.y + CARD_PAD);
@@ -895,24 +1142,25 @@ impl App {
         }
     }
 
-    /// The tab row: outlined tabs standing on a line that opens under the open tab, so the
-    /// tab joins the panel below it; the name of the tab under the cursor (else the open one);
-    /// the slide handle's grip; and the pin.
+    /// The tab row: outlined tabs standing on a line that opens under the open tab (or the
+    /// search field), so it joins the panel below; the name of the tab under the cursor (else
+    /// the open one); the slide handle's grip; the search button or field; and the pin.
     fn draw_tabs(&self, cv: &Canvas) {
         let widgets = &self.widgets;
-        let active = tab_rect(widgets, self.active);
+        let searching = self.search.is_some();
+        let open = if searching { field_rect(widgets) } else { tab_rect(widgets, self.active) };
         let y = TAB_BASE - 0.5;
-        cv.line((PAD / 2.0, y), (active.x + 0.5, y), Ink::Edge);
-        cv.line((active.right() - 0.5, y), (EXPANDED.0 - PAD / 2.0, y), Ink::Edge);
+        cv.line((PAD / 2.0, y), (open.x + 0.5, y), Ink::Edge);
+        cv.line((open.right() - 0.5, y), (EXPANDED.0 - PAD / 2.0, y), Ink::Edge);
 
-        let mut named = self.active;
+        let mut named = tab_title(widgets, self.active);
         for t in 0..tab_count(widgets) {
             let r = tab_rect(widgets, t);
             let hot = cv.hovered(r);
             if hot {
-                named = t;
+                named = tab_title(widgets, t);
             }
-            let (fill, edge, ink) = match (t == self.active, hot) {
+            let (fill, edge, ink) = match (t == self.active && !searching, hot) {
                 (true, _) => (Some(Ink::Track), Ink::Edge, Ink::Text),
                 (false, true) => (Some(Ink::Track), Ink::Line, Ink::Text),
                 (false, false) => (None, Ink::Line, Ink::Dim),
@@ -921,15 +1169,32 @@ impl App {
             cv.text(tab_icon(widgets, t), Font::Icon, ink, r, Align::Center);
         }
 
-        let handle = handle_rect(widgets);
-        // The name stops short of the grip in the middle.
-        let label = Rect::new(handle.x + 8.0, TAB_Y, handle.w / 2.0 - 20.0, TAB_H);
-        cv.text(tab_title(widgets, named), Font::Label, Ink::Dim, label, Align::Left);
-        // Grip: two rows of three dots, centred in the handle.
-        let hot = matches!(self.drag, Some(Drag::Slide { .. })) || cv.hovered(handle);
-        let (cx, cy) = (handle.x + handle.w / 2.0, TAB_Y + TAB_H / 2.0);
-        for (dx, dy) in [-5.0, 0.0, 5.0].into_iter().flat_map(|dx| [(dx, -2.5), (dx, 2.5)]) {
-            cv.circle(cx + dx, cy + dy, 1.25, if hot { Ink::Text } else { Ink::Dim }, None);
+        if let Some(field) = &self.search {
+            // The field looks like the open tab: filled, edged, joined to the panel.
+            let f = field_rect(widgets);
+            cv.tab(f, TAB_RADIUS, Some(Ink::Track), Some(Ink::Edge));
+            cv.text(glyph::SEARCH, Font::Icon, Ink::Dim, Rect { w: FIELD_ICON, ..f }, Align::Center);
+            let caret_on = self.keyboard.as_ref().is_some_and(|kb| kb.caret_on);
+            text::draw(cv, field, field_text_rect(widgets), Font::Body, "Search apps", caret_on);
+        } else {
+            let search = search_rect(widgets);
+            let search_hot = cv.hovered(search);
+            if search_hot {
+                named = "Search";
+            }
+            let handle = handle_rect(widgets);
+            // The name stops short of the grip in the middle.
+            let label = Rect::new(handle.x + 8.0, TAB_Y, handle.w / 2.0 - 20.0, TAB_H);
+            cv.text(named, Font::Label, Ink::Dim, label, Align::Left);
+            // Grip: two rows of three dots, centred in the handle.
+            let hot = matches!(self.drag, Some(Drag::Slide { .. })) || cv.hovered(handle);
+            let (cx, cy) = (handle.x + handle.w / 2.0, TAB_Y + TAB_H / 2.0);
+            for (dx, dy) in [-5.0, 0.0, 5.0].into_iter().flat_map(|dx| [(dx, -2.5), (dx, 2.5)]) {
+                cv.circle(cx + dx, cy + dy, 1.25, if hot { Ink::Text } else { Ink::Dim }, None);
+            }
+            // The search button, drawn like an unselected tab.
+            cv.tab(search, TAB_RADIUS, search_hot.then_some(Ink::Track), Some(Ink::Line));
+            cv.text(glyph::SEARCH, Font::Icon, if search_hot { Ink::Text } else { Ink::Dim }, search, Align::Center);
         }
 
         let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
@@ -963,6 +1228,17 @@ fn primary_button_down() -> bool {
     let button = if swapped { VK_RBUTTON } else { VK_LBUTTON };
     let state = unsafe { GetAsyncKeyState(i32::from(button.0)) };
     state < 0
+}
+
+/// Whether `vk` is down, as of the message being handled.
+fn key_down(vk: VIRTUAL_KEY) -> bool {
+    unsafe { GetKeyState(i32::from(vk.0)) < 0 }
+}
+
+/// The caret blink period; `None` when the user turned blinking off.
+fn caret_blink() -> Option<Duration> {
+    let ms = unsafe { GetCaretBlinkTime() };
+    (ms != 0 && ms != u32::MAX).then(|| Duration::from_millis(u64::from(ms)))
 }
 
 fn set_click_through(hwnd: HWND, on: bool) {
@@ -1120,13 +1396,41 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             with_app(|a| a.end_drag());
             LRESULT(0)
         }
-        // A sideways-arrows cursor over the slide handle.
+        // A sideways-arrows cursor over the slide handle; an I-beam over the search field.
         WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
-            let mut over = false;
-            with_app(|a| over = a.over_handle());
-            if over && let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZEWE) } {
+            let mut shape = None;
+            with_app(|a| {
+                shape = if a.over_handle() {
+                    Some(IDC_SIZEWE)
+                } else if a.over_field() {
+                    Some(IDC_IBEAM)
+                } else {
+                    None
+                };
+            });
+            if let Some(shape) = shape
+                && let Ok(cursor) = unsafe { LoadCursorW(None, shape) }
+            {
                 unsafe { SetCursor(Some(cursor)) };
                 return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let mut handled = false;
+            with_app(|a| handled = a.on_key(wparam.0 as u16, msg == WM_SYSKEYDOWN));
+            if handled { LRESULT(0) } else { unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } }
+        }
+        WM_CHAR => {
+            let mut handled = false;
+            with_app(|a| handled = a.on_char(wparam.0 as u16));
+            if handled { LRESULT(0) } else { unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } }
+        }
+        // The user went elsewhere: stop typing, and leave the focus where it went.
+        // DefWindowProcW must still see it; it's what moves the keyboard focus.
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                with_app(|a| a.end_typing(false));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1212,5 +1516,42 @@ mod tests {
         assert!(in_notch(6.0, 26.0, w, h, r), "just inside the bottom-left curve");
         assert!(!in_notch(-0.5, 10.0, w, h, r), "left of the body");
         assert!(!in_notch(95.0, 32.0, w, h, r), "below the body");
+    }
+
+    #[test]
+    fn search_button_and_field_share_the_tab_row_stretch() {
+        use super::{
+            Canvas, Compact, Instant, Rect, TAB_GAP, Widget, field_rect, field_text_rect, handle_rect, search_rect,
+            settings_tab, stretch_rect, tab_rect,
+        };
+        // Not `widgets::all()`, which starts the media worker and a clipboard window.
+        struct Dummy;
+        impl Widget for Dummy {
+            fn title(&self) -> &'static str {
+                ""
+            }
+            fn icon(&self) -> &'static str {
+                ""
+            }
+            fn update(&mut self, _now: Instant) -> bool {
+                false
+            }
+            fn compact(&self) -> Option<Compact> {
+                None
+            }
+            fn draw(&self, _cv: &Canvas, _w: f32, _h: f32) {}
+        }
+        let widgets: Vec<Box<dyn Widget>> = (0..5).map(|_| Box::new(Dummy) as Box<dyn Widget>).collect();
+        let parts = |r: Rect| (r.x, r.y, r.w, r.h);
+        let (stretch, search, field) = (stretch_rect(&widgets), search_rect(&widgets), field_rect(&widgets));
+        let handle = handle_rect(&widgets);
+        assert_eq!(parts(stretch), (312.0, 0.0, 304.0, 40.0));
+        assert_eq!(parts(search), (572.0, 8.0, 44.0, 32.0));
+        assert_eq!(parts(field), (312.0, 8.0, 304.0, 32.0));
+        assert_eq!(parts(field_text_rect(&widgets)), (344.0, 8.0, 262.0, 32.0));
+        assert_eq!(parts(handle), (312.0, 0.0, 256.0, 40.0));
+        assert_eq!(handle.right() + TAB_GAP, search.x, "the handle stops short of the button");
+        assert_eq!(search.right(), field.right(), "the field covers the button");
+        assert_eq!(field.right() + TAB_GAP, tab_rect(&widgets, settings_tab(&widgets)).x);
     }
 }
