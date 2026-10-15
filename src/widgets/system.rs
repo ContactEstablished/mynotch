@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::{Compact, Widget};
-use crate::gfx::{Align, Canvas, Font, Ink, Rect};
+use crate::gfx::{Align, Canvas, Font, Ink, Rect, glyph};
 use crate::stats::{Snapshot, Stats};
 
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -67,6 +67,10 @@ fn graph(cv: &Canvas, r: Rect, values: impl ExactSizeIterator<Item = f32>, ink: 
 impl Widget for SystemWidget {
     fn title(&self) -> &'static str {
         "System"
+    }
+
+    fn icon(&self) -> &'static str {
+        glyph::PULSE
     }
 
     fn update(&mut self, now: Instant) -> bool {

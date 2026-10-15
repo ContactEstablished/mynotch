@@ -9,6 +9,7 @@ mod icon;
 mod imaging;
 mod media;
 mod settings;
+mod settings_panel;
 mod stats;
 mod timer;
 mod widgets;

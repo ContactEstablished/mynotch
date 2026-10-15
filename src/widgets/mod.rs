@@ -3,9 +3,12 @@
 
 mod apps;
 mod clipboard;
+mod clock;
 mod focus;
 mod media;
+mod stopwatch;
 mod system;
+mod time;
 
 use std::time::Instant;
 
@@ -36,6 +39,28 @@ fn button_row<const N: usize>(cx: f32, cy: f32, sizes: [f32; N], gap: f32) -> [R
     })
 }
 
+const KNOB_R: f32 = 8.0;
+
+/// A horizontal slider: `track` filled up to the knob at fraction `k` of its length.
+/// Disabled sliders are drawn grey.
+pub fn slider(cv: &Canvas, track: Rect, k: f32, hot: bool, enabled: bool) {
+    let x = track.x + track.w * k.clamp(0.0, 1.0);
+    cv.fill(track, track.h / 2.0, Ink::Track);
+    cv.fill(Rect { w: x - track.x, ..track }, track.h / 2.0, if enabled { Ink::Accent } else { Ink::Dim });
+    let r = if hot && enabled { KNOB_R + 1.0 } else { KNOB_R };
+    cv.circle(x, track.y + track.h / 2.0, r, if enabled { Ink::Text } else { Ink::Dim }, None);
+}
+
+/// The fraction of `track`'s length at x, for a slider.
+pub fn slider_at(track: Rect, x: f32) -> f32 {
+    ((x - track.x) / track.w).clamp(0.0, 1.0)
+}
+
+/// Generous hit area around a slider's track.
+pub fn slider_hit(track: Rect) -> Rect {
+    Rect::new(track.x - KNOB_R * 2.0, track.y - 14.0, track.w + KNOB_R * 4.0, track.h + 28.0)
+}
+
 /// "4:05", or "1:02:03" past an hour.
 fn clock(d: std::time::Duration) -> String {
     let s = d.as_secs();
@@ -52,8 +77,11 @@ pub struct Compact {
 }
 
 pub trait Widget {
-    /// Tab label.
+    /// Name, shown while its tab is hovered or open; also how the last tab is remembered.
     fn title(&self) -> &'static str;
+
+    /// Tab icon, from `glyph`.
+    fn icon(&self) -> &'static str;
 
     /// Advances internal state. Called every frame, so throttle expensive work.
     /// Returns true when the widget needs a redraw.
@@ -69,6 +97,22 @@ pub trait Widget {
     fn click(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) -> bool {
         false
     }
+
+    /// Left button down, before `click`. Returning true starts a drag instead of a click:
+    /// the shell holds the mouse, calls `drag` as it moves and `release` when the button
+    /// comes up, then saves preferences.
+    fn press(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) -> bool {
+        false
+    }
+
+    /// The mouse moved during a drag this widget started, in content-area coordinates (it
+    /// may be outside the panel). Returns true when the widget needs a redraw.
+    fn drag(&mut self, _x: f32, _y: f32) -> bool {
+        false
+    }
+
+    /// The button came up, ending the drag, in content-area coordinates.
+    fn release(&mut self, _x: f32, _y: f32) {}
 
     /// Restores this widget's preferences. Called once at startup.
     fn load(&mut self, _settings: &Settings) {}
@@ -108,7 +152,7 @@ pub trait Widget {
 pub fn all() -> Vec<Box<dyn Widget>> {
     vec![
         Box::new(media::MediaWidget::new()),
-        Box::new(focus::FocusWidget::new()),
+        Box::new(time::TimeWidget::new()),
         Box::new(apps::AppsWidget::new()),
         Box::new(clipboard::ClipboardWidget::new()),
         Box::new(system::SystemWidget::new()),

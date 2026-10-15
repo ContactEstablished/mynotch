@@ -8,14 +8,38 @@ use windows::Win32::UI::HiDpi::GetDpiForSystem;
 
 use super::{Compact, Widget};
 use crate::apps::{self, AppEntry, Loaded};
-use crate::gfx::{Align, Canvas, Font, Image, Ink, Rect, glyph};
+use crate::gfx::{Align, Canvas, Font, Image, Ink, Rect, Rgb, glyph};
 use crate::settings::Settings;
 
 const TILE_W: f32 = 84.0;
 const TILE_H: f32 = 88.0;
 const ICON: f32 = 40.0;
+const BADGE_R: f32 = 9.0;
 /// How many suggested apps get pinned on first run.
 const SUGGESTED_MAX: usize = 8;
+
+/// Windows' close-button red, for the unpin badge under the cursor.
+const DANGER: Rgb = Rgb(196, 43, 28);
+const BADGE: Rgb = Rgb(58, 58, 68);
+/// Dark marks on the accent-blue "pinned" badge.
+const ON_ACCENT: Rgb = Rgb(12, 12, 18);
+
+fn icon_rect(tile: Rect) -> Rect {
+    Rect::new(tile.x + (tile.w - ICON) / 2.0, tile.y + 10.0, ICON, ICON)
+}
+
+/// A badge on the top-right corner of a tile's icon, with a generous hit area.
+fn badge_rect(tile: Rect) -> Rect {
+    let icon = icon_rect(tile);
+    let (cx, cy) = (icon.right() + 2.0, icon.y + 2.0);
+    Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0)
+}
+
+fn badge(cv: &Canvas, tile: Rect, mark: &str, fill: Ink, ink: Ink) {
+    let r = badge_rect(tile);
+    cv.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, BADGE_R, fill, None);
+    cv.text(mark, Font::IconSmall, ink, r, Align::Center);
+}
 
 #[derive(Clone, Copy)]
 enum Tile<'a> {
@@ -26,7 +50,38 @@ enum Tile<'a> {
     Done,
 }
 
-/// App shortcuts: a grid of pinned apps; "+" opens a picker over every installed app.
+/// A pinned app held down: a launch if it's let go where it was, else a drag to reorder.
+struct Grab {
+    id: String,
+    /// Where it was pressed, and from the tile's corner.
+    from: (f32, f32),
+    offset: (f32, f32),
+    /// The cursor now.
+    at: (f32, f32),
+    /// Moved past `DRAG_SLOP`: a drag, not a click.
+    moving: bool,
+}
+
+/// How far a press must move to become a drag.
+const DRAG_SLOP: f32 = 6.0;
+
+/// Moves pinned app `id` to slot `to` among the `shown` ones (those installed, in order).
+/// Pinned apps that aren't installed keep their places. Returns true if it moved.
+fn reorder(pinned: &mut Vec<String>, shown: &[String], id: &str, to: usize) -> bool {
+    let Some(from) = shown.iter().position(|s| s == id) else { return false };
+    let to = to.min(shown.len() - 1);
+    let Some(i) = pinned.iter().position(|p| p == id).filter(|_| to != from) else { return false };
+    let moved = pinned.remove(i);
+    let target = &shown[to];
+    // Before the app it displaces when moving back, after it when moving on.
+    let at = pinned.iter().position(|p| p == target).map_or(pinned.len(), |at| if to > from { at + 1 } else { at });
+    pinned.insert(at, moved);
+    true
+}
+
+/// App shortcuts: a grid of pinned apps, each with an unpin badge on hover, that can be
+/// dragged into a new order; "+" opens a picker over every installed app, where clicking
+/// pins or unpins.
 pub struct AppsWidget {
     loader: Option<Receiver<Loaded>>,
     /// Every installed app, sorted by name; empty until the loader reports.
@@ -38,8 +93,9 @@ pub struct AppsWidget {
     picking: bool,
     /// First visible row.
     scroll: usize,
-    /// Content size at the last draw, for wheel handling.
+    /// Content size at the last draw, for wheel and drag handling.
     size: Cell<(f32, f32)>,
+    grab: Option<Grab>,
 }
 
 impl AppsWidget {
@@ -53,11 +109,56 @@ impl AppsWidget {
             picking: false,
             scroll: 0,
             size: Cell::new((672.0, 176.0)),
+            grab: None,
         }
     }
 
     fn is_pinned(&self, id: &str) -> bool {
         self.pinned.as_ref().is_some_and(|p| p.iter().any(|x| x == id))
+    }
+
+    /// Ids of the pinned apps that are installed, in their order on the grid.
+    fn shown(&self) -> Vec<String> {
+        let pinned = self.pinned.iter().flatten();
+        pinned.filter(|id| self.apps.iter().any(|a| &a.id == *id)).cloned().collect()
+    }
+
+    /// The pinned app's slot nearest content point (`x`, `y`), on the visible rows.
+    fn slot_at(&self, x: f32, y: f32, w: f32, h: f32, count: usize) -> usize {
+        let cols = Self::columns(w);
+        let left = (w - cols as f32 * TILE_W) / 2.0;
+        let col = (((x - left) / TILE_W).max(0.0) as usize).min(cols - 1);
+        let row = ((y / TILE_H).max(0.0) as usize).min(Self::visible_rows(h) - 1);
+        ((self.scroll + row) * cols + col).min(count.saturating_sub(1))
+    }
+
+    fn draw_tile(&self, cv: &Canvas, tile: Tile, r: Rect, hovered: bool) {
+        if hovered {
+            cv.fill(r, 12.0, Ink::Track);
+        }
+        let icon = icon_rect(r);
+        let label = Rect::new(r.x + 4.0, r.y + 58.0, r.w - 8.0, 18.0);
+        match tile {
+            Tile::App(app) => {
+                match self.icons.get(&app.id) {
+                    Some(img) => cv.image(img, icon, 0.0),
+                    None => cv.text(glyph::APPS, Font::IconLarge, Ink::Dim, icon, Align::Center),
+                }
+                cv.text(&app.name, Font::Small, Ink::Text, label, Align::Center);
+                if self.picking && self.is_pinned(&app.id) {
+                    badge(cv, r, glyph::CHECK, Ink::Accent, Ink::Rgb(ON_ACCENT));
+                } else if !self.picking && hovered {
+                    let fill = if cv.hovered(badge_rect(r)) { DANGER } else { BADGE };
+                    badge(cv, r, glyph::CLOSE, Ink::Rgb(fill), Ink::Text);
+                }
+            }
+            Tile::Add | Tile::Done => {
+                let (mark, text) = if matches!(tile, Tile::Add) { ("+", "Add apps") } else { ("✓", "Done") };
+                cv.circle(icon.x + ICON / 2.0, icon.y + ICON / 2.0, ICON / 2.0, Ink::Track, None);
+                cv.text(mark, Font::Heading, Ink::Text, icon, Align::Center);
+                cv.text(text, Font::Small, Ink::Dim, label, Align::Center);
+            }
+        }
     }
 
     fn tiles(&self) -> Vec<Tile<'_>> {
@@ -104,6 +205,10 @@ impl Widget for AppsWidget {
         "Apps"
     }
 
+    fn icon(&self) -> &'static str {
+        glyph::TILES
+    }
+
     fn update(&mut self, _now: Instant) -> bool {
         let Some(loader) = &self.loader else { return false };
         let mut changed = false;
@@ -135,30 +240,21 @@ impl Widget for AppsWidget {
             cv.text("Loading apps…", Font::Body, Ink::Dim, Rect::new(0.0, 0.0, w, h), Align::Center);
             return;
         }
+        let dragging = self.grab.as_ref().filter(|g| g.moving);
         for (tile, r) in self.layout(w, h) {
-            if cv.hovered(r) {
-                cv.fill(r, 12.0, Ink::Track);
+            match (dragging, tile) {
+                // The dragged app's slot stays open beneath it.
+                (Some(g), Tile::App(app)) if app.id == g.id => cv.fill(r, 12.0, Ink::Track),
+                _ => self.draw_tile(cv, tile, r, dragging.is_none() && cv.hovered(r)),
             }
-            let icon = Rect::new(r.x + (r.w - ICON) / 2.0, r.y + 10.0, ICON, ICON);
-            let label = Rect::new(r.x + 4.0, r.y + 58.0, r.w - 8.0, 18.0);
-            match tile {
-                Tile::App(app) => {
-                    match self.icons.get(&app.id) {
-                        Some(img) => cv.image(img, icon, 0.0),
-                        None => cv.text(glyph::APPS, Font::IconLarge, Ink::Dim, icon, Align::Center),
-                    }
-                    cv.text(&app.name, Font::Small, Ink::Text, label, Align::Center);
-                    if self.picking && self.is_pinned(&app.id) {
-                        cv.circle(icon.right() + 2.0, icon.y + 2.0, 6.0, Ink::Accent, None);
-                    }
-                }
-                Tile::Add | Tile::Done => {
-                    let (mark, text) = if matches!(tile, Tile::Add) { ("+", "Add apps") } else { ("✓", "Done") };
-                    cv.circle(icon.x + ICON / 2.0, icon.y + ICON / 2.0, ICON / 2.0, Ink::Track, None);
-                    cv.text(mark, Font::Heading, Ink::Text, icon, Align::Center);
-                    cv.text(text, Font::Small, Ink::Dim, label, Align::Center);
-                }
-            }
+        }
+        // The dragged app follows the cursor, over the rest.
+        if let Some(g) = dragging
+            && let Some(app) = self.apps.iter().find(|a| a.id == g.id)
+        {
+            let r = Rect::new(g.at.0 - g.offset.0, g.at.1 - g.offset.1, TILE_W, TILE_H);
+            cv.fill(r, 12.0, Ink::Hover);
+            self.draw_tile(cv, Tile::App(app), r, false);
         }
         // Scrollbar when the grid overflows.
         let max = self.max_scroll(w, h);
@@ -175,10 +271,12 @@ impl Widget for AppsWidget {
     fn click(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
         enum Hit {
             App(String),
+            Unpin(String),
             Add,
             Done,
         }
-        let hit = self.layout(w, h).into_iter().find(|(_, r)| r.contains(x, y)).map(|(tile, _)| match tile {
+        let hit = self.layout(w, h).into_iter().find(|(_, r)| r.contains(x, y)).map(|(tile, r)| match tile {
+            Tile::App(app) if !self.picking && badge_rect(r).contains(x, y) => Hit::Unpin(app.id.clone()),
             Tile::App(app) => Hit::App(app.id.clone()),
             Tile::Add => Hit::Add,
             Tile::Done => Hit::Done,
@@ -193,14 +291,67 @@ impl Widget for AppsWidget {
                     None => pinned.push(id),
                 }
             }
-            Some(Hit::App(id)) => apps::launch(&id),
+            Some(Hit::Unpin(id)) => {
+                if let Some(pinned) = &mut self.pinned {
+                    pinned.retain(|p| *p != id);
+                }
+                // The grid shrank; don't leave it scrolled past its end.
+                self.scroll = self.scroll.min(self.max_scroll(w, h));
+            }
             Some(toggle @ (Hit::Add | Hit::Done)) => {
                 self.picking = matches!(toggle, Hit::Add);
                 self.scroll = 0;
             }
-            None => return false,
+            // Pinned apps launch when let go; see `press`.
+            Some(Hit::App(_)) | None => return false,
         }
         true
+    }
+
+    /// A pinned app (not its unpin badge) is grabbed: a launch on release, unless it gets
+    /// dragged to a new place.
+    fn press(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        if self.picking || !self.loaded {
+            return false;
+        }
+        self.size.set((w, h));
+        let grabbed = self.layout(w, h).into_iter().find_map(|(tile, r)| match tile {
+            Tile::App(app) if r.contains(x, y) && !badge_rect(r).contains(x, y) => Some((app.id.clone(), r)),
+            _ => None,
+        });
+        let Some((id, r)) = grabbed else { return false };
+        self.grab = Some(Grab { id, from: (x, y), offset: (x - r.x, y - r.y), at: (x, y), moving: false });
+        true
+    }
+
+    /// Past a few pixels, the grabbed app moves to the slot under the cursor as it goes.
+    fn drag(&mut self, x: f32, y: f32) -> bool {
+        let shown = self.shown();
+        let (w, h) = self.size.get();
+        let slot = self.slot_at(x, y, w, h, shown.len());
+        let Some(g) = &mut self.grab else { return false };
+        if g.at == (x, y) {
+            return false;
+        }
+        g.at = (x, y);
+        let (dx, dy) = (x - g.from.0, y - g.from.1);
+        g.moving |= dx * dx + dy * dy >= DRAG_SLOP * DRAG_SLOP;
+        if !g.moving {
+            return false;
+        }
+        let id = g.id.clone();
+        if let Some(pinned) = &mut self.pinned {
+            reorder(pinned, &shown, &id, slot);
+        }
+        true
+    }
+
+    fn release(&mut self, _x: f32, _y: f32) {
+        if let Some(g) = self.grab.take()
+            && !g.moving
+        {
+            apps::launch(&g.id);
+        }
     }
 
     fn wheel(&mut self, notches: f32) -> bool {
@@ -221,5 +372,38 @@ impl Widget for AppsWidget {
         if self.pinned.is_some() {
             settings.apps = self.pinned.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reorder;
+
+    fn ids(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn reorders_among_shown_apps_and_keeps_hidden_ones() {
+        // "x" is pinned but not installed, so not shown.
+        let shown = ids("a b c d");
+        let mut pinned = ids("a x b c d");
+        assert!(reorder(&mut pinned, &shown, "a", 2), "forwards");
+        assert_eq!(pinned, ids("x b c a d"));
+        let mut pinned = ids("a x b c d");
+        assert!(reorder(&mut pinned, &shown, "d", 0), "backwards");
+        assert_eq!(pinned, ids("d a x b c"));
+        let mut pinned = ids("a x b c d");
+        assert!(reorder(&mut pinned, &shown, "b", 99), "past the end: last");
+        assert_eq!(pinned, ids("a x c d b"));
+    }
+
+    #[test]
+    fn same_slot_or_unknown_app_changes_nothing() {
+        let shown = ids("a b c");
+        let mut pinned = ids("a b c");
+        assert!(!reorder(&mut pinned, &shown, "b", 1));
+        assert!(!reorder(&mut pinned, &shown, "zzz", 0));
+        assert_eq!(pinned, ids("a b c"));
     }
 }

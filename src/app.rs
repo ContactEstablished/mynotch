@@ -15,6 +15,7 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::*,
+            Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON, VK_RBUTTON},
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
                 Shell_NotifyIconW,
@@ -26,9 +27,10 @@ use windows::{
 };
 
 use crate::desktop::{self, autostart};
-use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Rect, glyph};
+use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Look, Rect, glyph};
 use crate::icon;
 use crate::settings::Settings;
+use crate::settings_panel::{self, Hit};
 use crate::widgets::{self, Compact, Widget};
 
 const TIMER_FRAME: usize = 1;
@@ -55,30 +57,69 @@ const SHADOW: f32 = 18.0;
 
 // Expanded layout, in logical units relative to the expanded notch's top-left.
 const PAD: f32 = 24.0;
-const TAB_Y: f32 = 12.0;
-const TAB_W: f32 = 80.0;
-const TAB_H: f32 = 24.0;
+const TAB_Y: f32 = 8.0;
+const TAB_W: f32 = 44.0;
+const TAB_H: f32 = 32.0;
 const TAB_GAP: f32 = 4.0;
-const PIN: Rect = Rect::new(EXPANDED.0 - PAD - TAB_H, TAB_Y, TAB_H, TAB_H);
+const TAB_RADIUS: f32 = 8.0;
+/// Where the line the tabs stand on is.
+const TAB_BASE: f32 = TAB_Y + TAB_H;
+const PIN_SIZE: f32 = 24.0;
+const PIN: Rect = Rect::new(EXPANDED.0 - PAD - PIN_SIZE, TAB_Y + (TAB_H - PIN_SIZE) / 2.0, PIN_SIZE, PIN_SIZE);
 const CONTENT: Rect = Rect::new(PAD, 48.0, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - 48.0 - 16.0);
 // Home dashboard cards.
 const CARD_GAP: f32 = 12.0;
 const CARD_PAD: f32 = 14.0;
 const CARD_RADIUS: f32 = 16.0;
+/// A slide that ends this close to the middle of the screen snaps to it.
+const SNAP: f32 = 12.0;
 
-/// Tab 0 is the Home dashboard; widget `i` is tab `i + 1`.
+/// Tab 0 is the Home dashboard; widget `i` is tab `i + 1`; the Settings tab is last, on the
+/// right (see `settings_tab`).
 const HOME: usize = 0;
 
-fn tab_rect(i: usize) -> Rect {
-    Rect::new(PAD + i as f32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
+fn settings_tab(widgets: &[Box<dyn Widget>]) -> usize {
+    widgets.len() + 1
+}
+
+fn tab_count(widgets: &[Box<dyn Widget>]) -> usize {
+    widgets.len() + 2
+}
+
+fn tab_rect(widgets: &[Box<dyn Widget>], tab: usize) -> Rect {
+    if tab == settings_tab(widgets) {
+        Rect::new(PIN.x - 8.0 - TAB_W, TAB_Y, TAB_W, TAB_H)
+    } else {
+        Rect::new(PAD + tab as f32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
+    }
 }
 
 fn tab_title(widgets: &[Box<dyn Widget>], tab: usize) -> &'static str {
-    if tab == HOME { "Home" } else { widgets[tab - 1].title() }
+    match tab {
+        HOME => "Home",
+        t if t == settings_tab(widgets) => "Settings",
+        t => widgets[t - 1].title(),
+    }
 }
 
+fn tab_icon(widgets: &[Box<dyn Widget>], tab: usize) -> &'static str {
+    match tab {
+        HOME => glyph::HOME,
+        t if t == settings_tab(widgets) => glyph::GEAR,
+        t => widgets[t - 1].icon(),
+    }
+}
+
+/// The tab to restore by title. Never the Settings tab, which only opens when clicked.
 fn tab_named(widgets: &[Box<dyn Widget>], title: &str) -> Option<usize> {
     (0..=widgets.len()).find(|&t| tab_title(widgets, t) == title)
+}
+
+/// The empty stretch of the tab row between the widget tabs and the Settings tab. Dragging
+/// it slides the notch along the top of the screen.
+fn handle_rect(widgets: &[Box<dyn Widget>]) -> Rect {
+    let x = tab_rect(widgets, widgets.len()).right() + TAB_GAP;
+    Rect::new(x, 0.0, tab_rect(widgets, settings_tab(widgets)).x - TAB_GAP - x, TAB_BASE)
 }
 
 /// Home dashboard cards as (widget index, rect in content coordinates), sized by weight.
@@ -157,19 +198,39 @@ impl Drop for Surface {
 /// Rebuilt on `WM_DISPLAYCHANGE` / `WM_DPICHANGED`.
 struct Layout {
     scale: f32,
-    /// Window origin and size (the expanded footprint plus shadow room), in physical px.
-    x: i32,
-    y: i32,
+    /// Window size (the expanded footprint plus shadow room), in physical px.
     w: i32,
     h: i32,
-    /// The primary monitor's bounds, for fullscreen detection.
+    /// The primary monitor's bounds: where the notch slides, and for fullscreen detection.
     monitor: RECT,
     surface: Surface,
     fonts: Fonts,
 }
 
+/// Where the notch is this frame, in physical px.
+struct Placement {
+    /// The window's screen position.
+    x: i32,
+    y: i32,
+    /// Window-relative left edge of the body, which slides as the notch animates.
+    body: f32,
+    /// Window-relative x of the expanded layout's origin.
+    origin: f32,
+}
+
+/// Screen x of the body's left edge when collapsed and when expanded, at `position` along a
+/// monitor spanning `left..left + width` (0 = collapsed notch flush left, 1 = flush right).
+/// Both centre on the same point, except that the expanded notch keeps its shadow on-screen.
+fn edges(left: f32, width: f32, scale: f32, position: f32) -> (f32, f32) {
+    let (cw, ew, shadow) = (COLLAPSED.0 * scale, EXPANDED.0 * scale, SHADOW * scale);
+    let centre = left + cw / 2.0 + position.clamp(0.0, 1.0) * (width - cw);
+    let collapsed = (centre - cw / 2.0).clamp(left, (left + width - cw).max(left));
+    let expanded = (centre - ew / 2.0).clamp(left + shadow, (left + width - ew - shadow).max(left + shadow));
+    (collapsed, expanded)
+}
+
 impl Layout {
-    /// Centred at the top of the primary monitor.
+    /// At the top of the primary monitor.
     unsafe fn primary(dwrite: &IDWriteFactory) -> Result<Self> {
         unsafe {
             let mon = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
@@ -181,29 +242,35 @@ impl Layout {
 
             let w = ((EXPANDED.0 + SHADOW * 2.0) * scale).ceil() as i32;
             let h = ((EXPANDED.1 + SHADOW) * scale).ceil() as i32;
-            let m = info.rcMonitor;
 
             Ok(Self {
                 scale,
-                x: m.left + (m.right - m.left - w) / 2,
-                y: m.top,
                 w,
                 h,
-                monitor: m,
+                monitor: info.rcMonitor,
                 surface: Surface::new(w, h)?,
                 fonts: Fonts::new(dwrite, scale)?,
             })
         }
     }
 
-    /// Window-relative physical x of the expanded layout's origin. The fixed-size expanded
-    /// layout stays centred (and clipped to the body) while the notch animates.
-    fn origin_x(&self) -> f32 {
-        (self.w as f32 - EXPANDED.0 * self.scale) / 2.0
+    /// How far the notch's centre can travel, in physical px.
+    fn travel(&self) -> f32 {
+        ((self.monitor.right - self.monitor.left) as f32 - COLLAPSED.0 * self.scale).max(1.0)
+    }
+
+    /// The window sits around the expanded notch; the fixed-size expanded layout stays put
+    /// there (clipped to the body) while the body animates between its two positions.
+    fn place(&self, position: f32, t: f32) -> Placement {
+        let m = &self.monitor;
+        let (collapsed, expanded) = edges(m.left as f32, (m.right - m.left) as f32, self.scale, position);
+        let x = (expanded - SHADOW * self.scale).round() as i32;
+        let body = lerp(collapsed, expanded, ease(t));
+        Placement { x, y: m.top, body: body - x as f32, origin: expanded - x as f32 }
     }
 }
 
-unsafe fn create_target(d2d: &ID2D1Factory) -> Result<(ID2D1DCRenderTarget, Brushes)> {
+unsafe fn create_target(d2d: &ID2D1Factory, look: Look) -> Result<(ID2D1DCRenderTarget, Brushes)> {
     unsafe {
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -218,9 +285,26 @@ unsafe fn create_target(d2d: &ID2D1Factory) -> Result<(ID2D1DCRenderTarget, Brus
         };
         let rt = d2d.CreateDCRenderTarget(&props)?;
         rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        let brushes = Brushes::new(&rt)?;
+        let brushes = Brushes::new(&rt, look)?;
         Ok((rt, brushes))
     }
+}
+
+/// A mouse drag in progress; the window has captured the mouse.
+#[derive(Clone, Copy)]
+enum Drag {
+    /// Sliding the notch along the top of the screen, from the cursor's screen x and the
+    /// notch's position when the drag began.
+    Slide { from_x: i32, from: f32 },
+    /// Setting opacity with the Settings tab's slider.
+    Opacity,
+    /// A drag a widget started from its `press` (by index into `widgets`).
+    Widget(usize),
+}
+
+/// Something a click asks for that runs a modal loop, so must happen outside the `APP` borrow.
+enum Modal {
+    PickColor,
 }
 
 struct App {
@@ -245,8 +329,9 @@ struct App {
     /// Window opacity: 1.0 = shown, 0.0 = faded out.
     fade: f32,
     next_fullscreen_check: Instant,
-    /// Keeps the notch open while its own context menu is showing.
-    menu_open: bool,
+    /// Keeps the notch open while its own context menu or colour picker is showing.
+    modal_open: bool,
+    drag: Option<Drag>,
     /// Keeps the notch open until then, after a widget asked for attention.
     peek_until: Option<Instant>,
     /// The tray (and window) icon we drew; `None` falls back to the stock application icon.
@@ -321,9 +406,9 @@ impl App {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let (rt, brushes) = create_target(&d2d)?;
-            let layout = Layout::primary(&dwrite)?;
             let settings = Settings::load();
+            let (rt, brushes) = create_target(&d2d, settings_panel::look(&settings))?;
+            let layout = Layout::primary(&dwrite)?;
             let mut widgets = widgets::all();
             for w in &mut widgets {
                 w.load(&settings);
@@ -349,7 +434,8 @@ impl App {
                 next_fullscreen_check: Instant::now(),
                 peek_until: None,
                 icon: None,
-                menu_open: false,
+                modal_open: false,
+                drag: None,
                 interactive: true,
                 dirty: true,
             })
@@ -403,10 +489,43 @@ impl App {
     fn select_tab(&mut self, i: usize) {
         if i != self.active {
             self.active = i;
-            self.settings.tab = tab_title(&self.widgets, i).to_string();
-            self.settings.save();
+            // Settings is never reopened by itself, so isn't remembered.
+            if i != settings_tab(&self.widgets) {
+                self.settings.tab = tab_title(&self.widgets, i).to_string();
+                self.settings.save();
+            }
             self.dirty = true;
         }
+    }
+
+    /// Repaints the body with a new colour and opacity. The caller saves the settings.
+    fn set_look(&mut self, color: u32, opacity: u32) {
+        if (color, opacity) != (self.settings.color, self.settings.opacity) {
+            self.settings.color = color;
+            self.settings.opacity = opacity;
+            let _ = unsafe { self.brushes.restyle(&self.rt, settings_panel::look(&self.settings)) };
+            self.dirty = true;
+        }
+    }
+
+    fn placement(&self) -> Placement {
+        self.layout.place(self.settings.position, self.t)
+    }
+
+    /// The cursor in expanded-layout logical coordinates.
+    fn cursor_logical(&self) -> (f32, f32) {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let (p, s) = (self.placement(), self.layout.scale);
+        (((pt.x - p.x) as f32 - p.origin) / s, (pt.y - p.y) as f32 / s)
+    }
+
+    /// Whether the cursor is over the open notch's slide handle.
+    fn over_handle(&self) -> bool {
+        let (x, y) = self.cursor_logical();
+        self.t >= 0.9 && handle_rect(&self.widgets).contains(x, y)
     }
 
     /// The collapsed readout, and the index of the widget providing it.
@@ -449,6 +568,17 @@ impl App {
             self.peek_until = None;
         }
 
+        // The notch is never the foreground window, so its mouse capture only sees the
+        // cursor while it's over the window: follow the drag here too, and end it once the
+        // button is up even if the release happened elsewhere.
+        if self.drag.is_some() {
+            if primary_button_down() {
+                self.on_drag();
+            } else {
+                self.end_drag();
+            }
+        }
+
         // Fade out and hide while a fullscreen app has the foreground; come back after.
         if now >= self.next_fullscreen_check {
             self.next_fullscreen_check = now + FULLSCREEN_POLL;
@@ -482,28 +612,25 @@ impl App {
         unsafe {
             let _ = GetCursorPos(&mut pt);
         }
-        let l = &self.layout;
-        let s = l.scale;
+        let s = self.layout.scale;
+        let p = self.placement();
         let (nw, nh) = self.notch_size();
         let m = HOVER_MARGIN * s;
-        let body_left = l.x as f32 + (l.w as f32 - nw) / 2.0;
-        let left = body_left - m;
+        let (body_left, top) = (p.x as f32 + p.body, p.y as f32);
         let (px, py) = (pt.x as f32, pt.y as f32);
-        let hovered = !self.hidden
-            && px >= left
-            && px < left + nw + m * 2.0
-            && py >= l.y as f32
-            && py < l.y as f32 + nh + m;
+        let dragging = self.drag.is_some();
+        let hovered = dragging
+            || !self.hidden && px >= body_left - m && px < body_left + nw + m && py >= top && py < top + nh + m;
 
         // Only the body takes clicks; the rest of the window, shadow included, lets them
-        // through to whatever is underneath.
-        let over_body = in_notch(px - body_left, py - l.y as f32, nw, nh, RADIUS * s);
+        // through to whatever is underneath. A drag keeps the mouse wherever it wanders.
+        let over_body = dragging || in_notch(px - body_left, py - top, nw, nh, RADIUS * s);
         if over_body != self.interactive {
             self.interactive = over_body;
             set_click_through(self.hwnd, !over_body);
         }
 
-        let cursor = hovered.then(|| ((px - l.x as f32 - l.origin_x()) / s, (py - l.y as f32) / s));
+        let cursor = hovered.then(|| ((px - p.x as f32 - p.origin) / s, (py - top) / s));
         if cursor != self.cursor {
             self.cursor = cursor;
             if self.t > 0.5 {
@@ -512,7 +639,7 @@ impl App {
         }
 
         let peeking = self.peek_until.is_some();
-        let target = if hovered || self.settings.pinned || self.menu_open || peeking { 1.0 } else { 0.0 };
+        let target = if hovered || self.settings.pinned || self.modal_open || peeking { 1.0 } else { 0.0 };
         if target > self.target && self.t < 0.5 {
             // Opening from collapsed: Home if that's where the user left it (it shows the live
             // activity anyway); else live activity (music, a running timer) takes the stage;
@@ -534,18 +661,40 @@ impl App {
         }
     }
 
-    /// A left click at window-relative physical coordinates.
-    fn on_click(&mut self, x: i32, y: i32) {
+    /// Left button down at window-relative physical coordinates.
+    fn on_press(&mut self, x: i32, y: i32) -> Option<Modal> {
         if self.t < 0.9 {
-            return;
+            return None;
         }
         let s = self.layout.scale;
-        let (lx, ly) = ((x as f32 - self.layout.origin_x()) / s, y as f32 / s);
+        let (lx, ly) = ((x as f32 - self.placement().origin) / s, y as f32 / s);
 
         if PIN.contains(lx, ly) {
             self.toggle_pin();
-        } else if let Some(t) = (0..=self.widgets.len()).find(|&t| tab_rect(t).contains(lx, ly)) {
+        } else if let Some(t) = (0..tab_count(&self.widgets)).find(|&t| tab_rect(&self.widgets, t).contains(lx, ly)) {
             self.select_tab(t);
+        } else if handle_rect(&self.widgets).contains(lx, ly) {
+            // Where the press happened, on screen (the cursor may have moved on since).
+            let from_x = self.placement().x + x;
+            self.begin_drag(Drag::Slide { from_x, from: self.settings.position });
+        } else if CONTENT.contains(lx, ly) && self.active == settings_tab(&self.widgets) {
+            let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
+            match settings_panel::hit(cx, cy)? {
+                Hit::Preset(color) => {
+                    self.set_look(color, self.settings.opacity);
+                    self.settings.save();
+                }
+                Hit::Custom => return Some(Modal::PickColor),
+                Hit::Opacity => {
+                    self.set_look(self.settings.color, settings_panel::opacity_at(cx));
+                    self.begin_drag(Drag::Opacity);
+                }
+                Hit::Center => {
+                    self.settings.position = 0.5;
+                    self.settings.save();
+                    self.dirty = true;
+                }
+            }
         } else if CONTENT.contains(lx, ly) {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
             let handled = if self.active == HOME {
@@ -555,6 +704,10 @@ impl App {
                 })
             } else {
                 let i = self.active - 1;
+                if self.widgets[i].press(cx, cy, CONTENT.w, CONTENT.h) {
+                    self.begin_drag(Drag::Widget(i));
+                    return None;
+                }
                 Some((i, self.widgets[i].click(cx, cy, CONTENT.w, CONTENT.h)))
             };
             if let Some((_, true)) = handled {
@@ -562,6 +715,61 @@ impl App {
                 self.persist_widgets();
             }
         }
+        None
+    }
+
+    fn begin_drag(&mut self, drag: Drag) {
+        unsafe { SetCapture(self.hwnd) };
+        self.drag = Some(drag);
+        self.dirty = true;
+    }
+
+    /// The mouse moved while the window has it captured.
+    fn on_drag(&mut self) {
+        let Some(drag) = self.drag else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        match drag {
+            Drag::Slide { from_x, from } => {
+                let travel = self.layout.travel();
+                let mut position = (from + (pt.x - from_x) as f32 / travel).clamp(0.0, 1.0);
+                if ((position - 0.5) * travel).abs() < SNAP * self.layout.scale {
+                    position = 0.5;
+                }
+                if position != self.settings.position {
+                    self.settings.position = position;
+                    self.dirty = true;
+                }
+            }
+            Drag::Opacity => {
+                let (x, _) = self.cursor_logical();
+                self.set_look(self.settings.color, settings_panel::opacity_at(x - CONTENT.x));
+            }
+            Drag::Widget(i) => {
+                let (x, y) = self.cursor_logical();
+                if self.widgets[i].drag(x - CONTENT.x, y - CONTENT.y) {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// The button came up: keep what the drag set.
+    fn end_drag(&mut self) {
+        let Some(drag) = self.drag.take() else { return };
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if let Drag::Widget(i) = drag {
+            let (x, y) = self.cursor_logical();
+            self.widgets[i].release(x - CONTENT.x, y - CONTENT.y);
+            self.persist_widgets();
+        } else {
+            self.settings.save();
+        }
+        self.dirty = true;
     }
 
     /// Saves the settings file if any widget's preferences changed.
@@ -578,7 +786,17 @@ impl App {
     /// Mouse wheel, in notches: goes to the open panel. (Windows only sends it while the
     /// cursor is over the notch.)
     fn on_wheel(&mut self, notches: f32) {
-        if self.t >= 0.9 && self.active != HOME && self.widgets[self.active - 1].wheel(notches) {
+        if self.t < 0.9 || self.active == HOME {
+            return;
+        }
+        if self.active == settings_tab(&self.widgets) {
+            let (x, y) = self.cursor_logical();
+            let (opacity, color) = (self.settings.opacity, self.settings.color);
+            if let Some(o) = settings_panel::wheel_opacity(x - CONTENT.x, y - CONTENT.y, opacity, notches) {
+                self.set_look(color, o);
+                self.settings.save();
+            }
+        } else if self.widgets[self.active - 1].wheel(notches) {
             self.dirty = true;
         }
     }
@@ -588,7 +806,8 @@ impl App {
         let l = &self.layout;
         let s = l.scale;
         let (nw, nh) = self.notch_size();
-        let left = (l.w as f32 - nw) / 2.0;
+        let p = self.placement();
+        let left = p.body;
         let e = ease(self.t);
 
         unsafe {
@@ -615,32 +834,13 @@ impl App {
                 body.text(&compact.text, Font::Small, Ink::Dim, r, Align::Center);
             }
 
-            // Expanded content: fixed layout, centred and clipped to the animating body.
+            // Expanded content: fixed layout, clipped to the animating body.
             if e > 0.5 {
                 self.brushes.set_content_opacity((e - 0.5) * 2.0);
-                let ox = l.origin_x();
+                let ox = p.origin;
                 let cv = canvas(ox, self.cursor);
                 cv.push_clip(Rect::new((left - ox) / s, 0.0, nw / s, nh / s));
-
-                for t in 0..=self.widgets.len() {
-                    let r = tab_rect(t);
-                    let ink = if t == self.active {
-                        cv.fill(r, TAB_H / 2.0, Ink::Track);
-                        Ink::Text
-                    } else if cv.hovered(r) {
-                        Ink::Text
-                    } else {
-                        Ink::Dim
-                    };
-                    cv.text(tab_title(&self.widgets, t), Font::Label, ink, r, Align::Center);
-                }
-
-                let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
-                    (true, _) => (glyph::PINNED, Ink::Accent),
-                    (false, true) => (glyph::PIN, Ink::Text),
-                    (false, false) => (glyph::PIN, Ink::Dim),
-                };
-                cv.text(pin, Font::Icon, ink, PIN, Align::Center);
+                self.draw_tabs(&cv);
 
                 let content = cv.offset(CONTENT.x, CONTENT.y);
                 if self.active == HOME {
@@ -649,6 +849,8 @@ impl App {
                         let inner = content.offset(r.x + CARD_PAD, r.y + CARD_PAD);
                         self.widgets[i].draw_card(&inner, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0);
                     }
+                } else if self.active == settings_tab(&self.widgets) {
+                    settings_panel::draw(&content, CONTENT.w, &self.settings);
                 } else {
                     self.widgets[self.active - 1].draw(&content, CONTENT.w, CONTENT.h);
                 }
@@ -659,7 +861,7 @@ impl App {
                 Ok(()) => {}
                 Err(err) if err.code() == D2DERR_RECREATE_TARGET => {
                     // Device lost: rebuild the target and brushes, redraw next tick.
-                    if let Ok((rt, brushes)) = create_target(&self.d2d) {
+                    if let Ok((rt, brushes)) = create_target(&self.d2d, settings_panel::look(&self.settings)) {
                         self.rt = rt;
                         self.brushes = brushes;
                         self.images.clear();
@@ -670,7 +872,7 @@ impl App {
                 Err(_) => return,
             }
 
-            let dst = POINT { x: l.x, y: l.y };
+            let dst = POINT { x: p.x, y: p.y };
             let size = SIZE { cx: l.w, cy: l.h };
             let src = POINT::default();
             let blend = BLENDFUNCTION {
@@ -692,6 +894,51 @@ impl App {
             );
         }
     }
+
+    /// The tab row: outlined tabs standing on a line that opens under the open tab, so the
+    /// tab joins the panel below it; the name of the tab under the cursor (else the open one);
+    /// the slide handle's grip; and the pin.
+    fn draw_tabs(&self, cv: &Canvas) {
+        let widgets = &self.widgets;
+        let active = tab_rect(widgets, self.active);
+        let y = TAB_BASE - 0.5;
+        cv.line((PAD / 2.0, y), (active.x + 0.5, y), Ink::Edge);
+        cv.line((active.right() - 0.5, y), (EXPANDED.0 - PAD / 2.0, y), Ink::Edge);
+
+        let mut named = self.active;
+        for t in 0..tab_count(widgets) {
+            let r = tab_rect(widgets, t);
+            let hot = cv.hovered(r);
+            if hot {
+                named = t;
+            }
+            let (fill, edge, ink) = match (t == self.active, hot) {
+                (true, _) => (Some(Ink::Track), Ink::Edge, Ink::Text),
+                (false, true) => (Some(Ink::Track), Ink::Line, Ink::Text),
+                (false, false) => (None, Ink::Line, Ink::Dim),
+            };
+            cv.tab(r, TAB_RADIUS, fill, Some(edge));
+            cv.text(tab_icon(widgets, t), Font::Icon, ink, r, Align::Center);
+        }
+
+        let handle = handle_rect(widgets);
+        // The name stops short of the grip in the middle.
+        let label = Rect::new(handle.x + 8.0, TAB_Y, handle.w / 2.0 - 20.0, TAB_H);
+        cv.text(tab_title(widgets, named), Font::Label, Ink::Dim, label, Align::Left);
+        // Grip: two rows of three dots, centred in the handle.
+        let hot = matches!(self.drag, Some(Drag::Slide { .. })) || cv.hovered(handle);
+        let (cx, cy) = (handle.x + handle.w / 2.0, TAB_Y + TAB_H / 2.0);
+        for (dx, dy) in [-5.0, 0.0, 5.0].into_iter().flat_map(|dx| [(dx, -2.5), (dx, 2.5)]) {
+            cv.circle(cx + dx, cy + dy, 1.25, if hot { Ink::Text } else { Ink::Dim }, None);
+        }
+
+        let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
+            (true, _) => (glyph::PINNED, Ink::Accent),
+            (false, true) => (glyph::PIN, Ink::Text),
+            (false, false) => (glyph::PIN, Ink::Dim),
+        };
+        cv.text(pin, Font::Icon, ink, PIN, Align::Center);
+    }
 }
 
 /// Whether (`x`, `y`), relative to the body's top-left, is inside a `w` x `h` notch whose
@@ -707,6 +954,15 @@ fn in_notch(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
     }
     let (dx, dy) = (x - cx, y - cy);
     dx * dx + dy * dy <= r * r
+}
+
+/// Whether the primary mouse button is physically down now, wherever the cursor is.
+fn primary_button_down() -> bool {
+    // GetAsyncKeyState reads the physical buttons, so honour "switch primary and secondary".
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    let button = if swapped { VK_RBUTTON } else { VK_LBUTTON };
+    let state = unsafe { GetAsyncKeyState(i32::from(button.0)) };
+    state < 0
 }
 
 fn set_click_through(hwnd: HWND, on: bool) {
@@ -767,7 +1023,7 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
     let mut settings = Settings::default();
     with_app(|a| {
         settings = a.settings.clone();
-        a.menu_open = from_notch;
+        a.modal_open = from_notch;
     });
 
     let cmd = unsafe {
@@ -797,7 +1053,7 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
         cmd.0 as usize
     };
 
-    with_app(|a| a.menu_open = false);
+    with_app(|a| a.modal_open = false);
     match cmd {
         CMD_PIN => with_app(|a| a.toggle_pin()),
         CMD_FULLSCREEN => with_app(|a| a.toggle_hide_in_fullscreen()),
@@ -811,6 +1067,32 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
     }
 }
 
+/// Opens Windows' colour picker under the notch, which previews each colour tried and keeps
+/// the chosen one (or goes back on Cancel). Like `show_menu`, it runs a modal loop, so must be
+/// called without the `APP` borrow held.
+fn pick_color(hwnd: HWND) {
+    let mut start = None;
+    with_app(|a| {
+        a.modal_open = true;
+        let (p, s, m) = (a.placement(), a.layout.scale, a.layout.monitor);
+        let picker = settings_panel::Picker {
+            centre: p.x + (p.origin + EXPANDED.0 * s / 2.0) as i32,
+            top: p.y + ((EXPANDED.1 + 8.0) * s) as i32,
+            left: m.left,
+            right: m.right,
+            preview: |color| with_app(|a| a.set_look(color, a.settings.opacity)),
+        };
+        start = Some((a.settings.color, picker));
+    });
+    let Some((initial, picker)) = start else { return };
+    let picked = settings_panel::pick_color(hwnd, initial, picker);
+    with_app(|a| {
+        a.modal_open = false;
+        a.set_look(picked.unwrap_or(initial), a.settings.opacity);
+        a.settings.save();
+    });
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
@@ -822,8 +1104,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            with_app(|a| a.on_click(x, y));
+            let mut modal = None;
+            with_app(|a| modal = a.on_press(x, y));
+            if let Some(Modal::PickColor) = modal {
+                pick_color(hwnd);
+            }
             LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            with_app(|a| a.on_drag());
+            LRESULT(0)
+        }
+        // A lost capture doesn't end a drag: `tick` follows it until the button is up.
+        WM_LBUTTONUP => {
+            with_app(|a| a.end_drag());
+            LRESULT(0)
+        }
+        // A sideways-arrows cursor over the slide handle.
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            let mut over = false;
+            with_app(|a| over = a.over_handle());
+            if over && let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZEWE) } {
+                unsafe { SetCursor(Some(cursor)) };
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_RBUTTONUP => {
             show_menu(hwnd, true);
@@ -869,7 +1174,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 #[cfg(test)]
 mod tests {
-    use super::in_notch;
+    use super::{COLLAPSED, EXPANDED, SHADOW, edges, in_notch};
+
+    #[test]
+    fn centred_notch_is_concentric_on_the_monitor() {
+        let (collapsed, expanded) = edges(0.0, 1920.0, 1.0, 0.5);
+        assert_eq!(collapsed + COLLAPSED.0 / 2.0, 960.0);
+        assert_eq!(expanded + EXPANDED.0 / 2.0, 960.0);
+        let (collapsed, expanded) = edges(-2560.0, 2560.0, 1.5, 0.5);
+        assert_eq!(collapsed + COLLAPSED.0 * 1.5 / 2.0, -1280.0, "a monitor left of the primary, scaled");
+        assert_eq!(expanded + EXPANDED.0 * 1.5 / 2.0, -1280.0);
+    }
+
+    #[test]
+    fn notch_slides_flush_to_the_edges_but_the_expanded_one_keeps_its_shadow_on_screen() {
+        let (collapsed, expanded) = edges(0.0, 1920.0, 1.0, 0.0);
+        assert_eq!(collapsed, 0.0, "collapsed: flush left");
+        assert_eq!(expanded, SHADOW, "expanded: shadow room to the left");
+        let (collapsed, expanded) = edges(0.0, 1920.0, 1.0, 1.0);
+        assert_eq!(collapsed + COLLAPSED.0, 1920.0, "collapsed: flush right");
+        assert_eq!(expanded + EXPANDED.0 + SHADOW, 1920.0);
+        // Partway: the collapsed notch moves on while the expanded one waits at the edge.
+        let (collapsed, expanded) = edges(0.0, 1920.0, 1.0, 0.1);
+        assert!(collapsed > 0.0 && expanded == SHADOW);
+        assert!(collapsed >= expanded - SHADOW && collapsed + COLLAPSED.0 <= expanded + EXPANDED.0 + SHADOW, "inside the window");
+    }
 
     #[test]
     fn notch_hit_area_follows_rounded_bottom_corners() {

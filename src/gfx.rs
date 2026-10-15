@@ -90,6 +90,82 @@ impl Rect {
     }
 }
 
+/// An opaque sRGB colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// From `0xRRGGBB`.
+    pub const fn from_hex(v: u32) -> Self {
+        Self((v >> 16) as u8, (v >> 8) as u8, v as u8)
+    }
+
+    /// As `0xRRGGBB`.
+    pub const fn hex(self) -> u32 {
+        (self.0 as u32) << 16 | (self.1 as u32) << 8 | self.2 as u32
+    }
+
+    fn map(self, f: impl Fn(f32) -> f32) -> Self {
+        let c = |v: u8| f(f32::from(v)).round().clamp(0.0, 255.0) as u8;
+        Self(c(self.0), c(self.1), c(self.2))
+    }
+
+    /// Mixed a fraction `k` of the way to white.
+    fn lighten(self, k: f32) -> Self {
+        self.map(|v| v + (255.0 - v) * k)
+    }
+
+    /// Each channel scaled by `k`.
+    fn darken(self, k: f32) -> Self {
+        self.map(|v| v * k)
+    }
+
+    /// A bright, fairly saturated colour of the same hue, for the body's inner glow. Greys
+    /// glow plain white.
+    fn glow(self) -> Self {
+        let [r, g, b] = [self.0, self.1, self.2].map(|v| f32::from(v) / 255.0);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let d = max - min;
+        if d < 0.02 {
+            return Self(230, 230, 236);
+        }
+        // Hue in sixths of a turn.
+        let h = if max == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        let (v, s) = (0.9, (d / max).max(0.6));
+        let c = v * s;
+        let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+        let (r, g, b) = match h as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        let m = v - c;
+        let f =|v: f32| ((v + m) * 255.0).round() as u8;
+        Self(f(r), f(g), f(b))
+    }
+
+    fn with_alpha(self, a: f32) -> D2D1_COLOR_F {
+        rgba(self.0, self.1, self.2, a)
+    }
+}
+
+/// How the notch body is painted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    pub color: Rgb,
+    /// 0..=1; scales the body and its shadow, not the content.
+    pub opacity: f32,
+}
+
 /// Content colours. `Track` and `Hover` are translucent white, so controls read as glass
 /// set into the body rather than flat grey.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,28 +177,38 @@ pub enum Ink {
     Accent,
     /// Teal, for rest (timer breaks).
     Calm,
+    /// Faint translucent white, for outlines.
+    Line,
+    /// Brighter translucent white, for outlines that should stand out.
+    Edge,
+    /// Any opaque colour (colour swatches, badges).
+    Rgb(Rgb),
 }
 
 const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a }
 }
 
-/// The obsidian body material (see `Canvas::glass`). Gradient geometry follows the
-/// animating notch, so it is set on every draw.
+/// The glass body material (see `Canvas::glass`), in the user's colour. Gradient geometry
+/// follows the animating notch, so it is set on every draw.
 struct Glass {
-    /// Near-black, slightly see-through; lifts a touch towards the top.
+    /// The body colour, slightly see-through; lifts a touch towards the top.
     base: ID2D1LinearGradientBrush,
     /// Soft reflection of light from the upper left.
     sheen: ID2D1RadialGradientBrush,
-    /// Faint violet glow in the lower right, like obsidian's sheen.
+    /// Faint glow of the body's hue in the lower right (violet for obsidian).
     tint: ID2D1RadialGradientBrush,
     /// Light catching the edge, strongest along the bottom.
     rim: ID2D1LinearGradientBrush,
     shadow: ID2D1SolidColorBrush,
+    /// Body opacity, which the shadow follows.
+    opacity: f32,
 }
 
 impl Glass {
-    unsafe fn new(rt: &ID2D1DCRenderTarget) -> Result<Self> {
+    unsafe fn new(rt: &ID2D1DCRenderTarget, look: Look) -> Result<Self> {
+        let (color, o) = (look.color, look.opacity.clamp(0.0, 1.0));
+        let glow = color.glow();
         unsafe {
             let stops = |colors: &[(f32, D2D1_COLOR_F)]| {
                 let stops: Vec<D2D1_GRADIENT_STOP> =
@@ -135,12 +221,17 @@ impl Glass {
             let radial = |colors: &[(f32, D2D1_COLOR_F)]| -> Result<ID2D1RadialGradientBrush> {
                 rt.CreateRadialGradientBrush(&D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES::default(), None, &stops(colors)?)
             };
+            // The default colour gives the original obsidian: top (18, 16, 25), bottom (4, 4, 7).
             Ok(Self {
-                base: linear(&[(0.0, rgba(17, 17, 24, 0.96)), (1.0, rgba(4, 4, 7, 0.97))])?,
-                sheen: radial(&[(0.0, rgba(255, 255, 255, 0.10)), (1.0, rgba(255, 255, 255, 0.0))])?,
-                tint: radial(&[(0.0, rgba(124, 92, 230, 0.14)), (1.0, rgba(124, 92, 230, 0.0))])?,
+                base: linear(&[
+                    (0.0, color.lighten(0.03).with_alpha(0.96 * o)),
+                    (1.0, color.darken(0.4).with_alpha(0.97 * o)),
+                ])?,
+                sheen: radial(&[(0.0, rgba(255, 255, 255, 0.10 * o)), (1.0, rgba(255, 255, 255, 0.0))])?,
+                tint: radial(&[(0.0, glow.with_alpha(0.14 * o)), (1.0, glow.with_alpha(0.0))])?,
                 rim: linear(&[(0.0, rgba(255, 255, 255, 0.04)), (1.0, rgba(255, 255, 255, 0.28))])?,
                 shadow: rt.CreateSolidColorBrush(&rgba(0, 0, 0, 1.0), None)?,
+                opacity: o,
             })
         }
     }
@@ -154,13 +245,17 @@ pub struct Brushes {
     hover: ID2D1SolidColorBrush,
     accent: ID2D1SolidColorBrush,
     calm: ID2D1SolidColorBrush,
+    line: ID2D1SolidColorBrush,
+    edge: ID2D1SolidColorBrush,
+    /// Recoloured for each `Ink::Rgb` use.
+    paint: ID2D1SolidColorBrush,
     glass: Glass,
     /// Last value given to `set_content_opacity`, applied to images too.
     content_opacity: Cell<f32>,
 }
 
 impl Brushes {
-    pub unsafe fn new(rt: &ID2D1DCRenderTarget) -> Result<Self> {
+    pub unsafe fn new(rt: &ID2D1DCRenderTarget, look: Look) -> Result<Self> {
         let solid = |c: D2D1_COLOR_F| unsafe { rt.CreateSolidColorBrush(&c, None) };
         Ok(Self {
             text: solid(rgba(242, 242, 247, 1.0))?,
@@ -169,9 +264,18 @@ impl Brushes {
             hover: solid(rgba(255, 255, 255, 0.16))?,
             accent: solid(rgba(122, 176, 255, 1.0))?,
             calm: solid(rgba(102, 214, 184, 1.0))?,
-            glass: unsafe { Glass::new(rt)? },
+            line: solid(rgba(255, 255, 255, 0.12))?,
+            edge: solid(rgba(255, 255, 255, 0.30))?,
+            paint: solid(rgba(0, 0, 0, 1.0))?,
+            glass: unsafe { Glass::new(rt, look)? },
             content_opacity: Cell::new(1.0),
         })
+    }
+
+    /// Repaints the body in a new colour or opacity.
+    pub unsafe fn restyle(&mut self, rt: &ID2D1DCRenderTarget, look: Look) -> Result<()> {
+        self.glass = unsafe { Glass::new(rt, look)? };
+        Ok(())
     }
 
     fn get(&self, ink: Ink) -> &ID2D1SolidColorBrush {
@@ -182,6 +286,12 @@ impl Brushes {
             Ink::Hover => &self.hover,
             Ink::Accent => &self.accent,
             Ink::Calm => &self.calm,
+            Ink::Line => &self.line,
+            Ink::Edge => &self.edge,
+            Ink::Rgb(c) => {
+                unsafe { self.paint.SetColor(&c.with_alpha(1.0)) };
+                &self.paint
+            }
         }
     }
 
@@ -189,7 +299,17 @@ impl Brushes {
     pub fn set_content_opacity(&self, a: f32) {
         self.content_opacity.set(a);
         unsafe {
-            for b in [&self.text, &self.dim, &self.track, &self.hover, &self.accent, &self.calm] {
+            for b in [
+                &self.text,
+                &self.dim,
+                &self.track,
+                &self.hover,
+                &self.accent,
+                &self.calm,
+                &self.line,
+                &self.edge,
+                &self.paint,
+            ] {
                 b.SetOpacity(a);
             }
         }
@@ -216,8 +336,8 @@ pub enum Font {
     Body,
     /// 18px semibold.
     Heading,
-    /// 48px light, for the biggest numbers.
-    Hero,
+    /// 10px icon glyphs, for badges.
+    IconSmall,
 }
 
 /// Glyphs from Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10); the
@@ -236,10 +356,20 @@ pub mod glyph {
     pub const DOCUMENT: &str = "\u{E8A5}";
     pub const LINK: &str = "\u{E71B}";
     pub const DELETE: &str = "\u{E74D}";
+    pub const HOME: &str = "\u{E80F}";
+    pub const CLOCK: &str = "\u{E917}";
+    pub const TILES: &str = "\u{E74C}";
+    pub const PULSE: &str = "\u{E9D9}";
+    pub const GEAR: &str = "\u{E713}";
+    pub const CLOSE: &str = "\u{E894}";
+    pub const CHECK: &str = "\u{E73E}";
+    pub const PALETTE: &str = "\u{E790}";
 }
 
 /// Single-line text formats (no wrapping, ellipsis on overflow), sized for one DPI scale.
 pub struct Fonts {
+    /// Kept for measuring text.
+    dwrite: IDWriteFactory,
     small: IDWriteTextFormat,
     label: IDWriteTextFormat,
     title: IDWriteTextFormat,
@@ -249,7 +379,7 @@ pub struct Fonts {
     display: IDWriteTextFormat,
     body: IDWriteTextFormat,
     heading: IDWriteTextFormat,
-    hero: IDWriteTextFormat,
+    icon_small: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -279,6 +409,7 @@ impl Fonts {
             };
             let ui = w!("Segoe UI");
             Ok(Self {
+                dwrite: dwrite.clone(),
                 small: make(ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 label: make(ui, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
                 title: make(ui, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
@@ -288,7 +419,7 @@ impl Fonts {
                 display: make(ui, 32.0, DWRITE_FONT_WEIGHT_LIGHT)?,
                 body: make(ui, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 heading: make(ui, 18.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                hero: make(ui, 48.0, DWRITE_FONT_WEIGHT_LIGHT)?,
+                icon_small: make(icons, 10.0, DWRITE_FONT_WEIGHT_NORMAL)?,
             })
         }
     }
@@ -304,7 +435,7 @@ impl Fonts {
             Font::Display => &self.display,
             Font::Body => &self.body,
             Font::Heading => &self.heading,
-            Font::Hero => &self.hero,
+            Font::IconSmall => &self.icon_small,
         }
     }
 }
@@ -406,9 +537,73 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Width of `s` set on one line in `font`.
+    pub fn measure(&self, s: &str, font: Font) -> f32 {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            match self.fonts.dwrite.CreateTextLayout(&wide, self.fonts.get(font), f32::MAX, f32::MAX) {
+                Ok(layout) if layout.GetMetrics(&mut metrics).is_ok() => metrics.widthIncludingTrailingWhitespace / self.scale,
+                _ => 0.0,
+            }
+        }
+    }
+
     pub fn fill(&self, r: Rect, radius: f32, ink: Ink) {
         let rr = D2D1_ROUNDED_RECT { rect: self.px(r), radiusX: radius * self.scale, radiusY: radius * self.scale };
         unsafe { self.rt.FillRoundedRectangle(&rr, self.brushes.get(ink)) };
+    }
+
+    /// A 1px line.
+    pub fn line(&self, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ink: Ink) {
+        let s = self.scale;
+        let p = |x: f32, y: f32| Vector2 { X: self.ox + x * s, Y: self.oy + y * s };
+        unsafe { self.rt.DrawLine(p(x0, y0), p(x1, y1), self.brushes.get(ink), s, None) };
+    }
+
+    /// A tab: rounded by `radius` at the top, square at the bottom. `fill` paints it; `edge`
+    /// outlines its top and sides but not its bottom, so it opens onto whatever is below.
+    pub fn tab(&self, r: Rect, radius: f32, fill: Option<Ink>, edge: Option<Ink>) {
+        let s = self.scale;
+        let outline = |inset: f32, closed: bool| -> Option<ID2D1PathGeometry> {
+            let px = self.px(r);
+            let (left, top, right, bottom) = (px.left + inset, px.top + inset, px.right - inset, px.bottom);
+            let rad = (radius * s - inset).max(0.0);
+            let corner = |x: f32, y: f32| D2D1_ARC_SEGMENT {
+                point: Vector2 { X: x, Y: y },
+                size: D2D_SIZE_F { width: rad, height: rad },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            };
+            unsafe {
+                let path = self.rt.GetFactory().ok()?.CreatePathGeometry().ok()?;
+                let sink = path.Open().ok()?;
+                let begin = if closed { D2D1_FIGURE_BEGIN_FILLED } else { D2D1_FIGURE_BEGIN_HOLLOW };
+                sink.BeginFigure(Vector2 { X: left, Y: bottom }, begin);
+                sink.AddLine(Vector2 { X: left, Y: top + rad });
+                sink.AddArc(&corner(left + rad, top));
+                sink.AddLine(Vector2 { X: right - rad, Y: top });
+                sink.AddArc(&corner(right, top + rad));
+                sink.AddLine(Vector2 { X: right, Y: bottom });
+                sink.EndFigure(if closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+                sink.Close().ok()?;
+                Some(path)
+            }
+        };
+        unsafe {
+            if let Some(ink) = fill
+                && let Some(path) = outline(0.0, true)
+            {
+                self.rt.FillGeometry(&path, self.brushes.get(ink), None);
+            }
+            // A 1px stroke centred half a pixel inside the edge.
+            if let Some(ink) = edge
+                && let Some(path) = outline(0.5 * s, false)
+            {
+                self.rt.DrawGeometry(&path, self.brushes.get(ink), s, None);
+            }
+        }
     }
 
     /// Filled circle, or an outline of `stroke` logical px.
@@ -427,7 +622,7 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// The notch body in obsidian glass. `r` may extend above y = 0 (to keep the top corners
+    /// The notch body in glass. `r` may extend above y = 0 (to keep the top corners
     /// off-screen); gradients span only its visible part. `shadow` (0..1) scales a soft drop
     /// shadow; it must stay 0 while collapsed, since shadow pixels would catch clicks.
     pub fn glass(&self, r: Rect, radius: f32, shadow: f32) {
@@ -446,7 +641,7 @@ impl<'a> Canvas<'a> {
                 for i in (1..=LAYERS).rev() {
                     let grow = i as f32 * 1.6 * s;
                     let k = 1.0 - i as f32 / (LAYERS + 1) as f32;
-                    g.shadow.SetOpacity(0.06 * k * k * shadow);
+                    g.shadow.SetOpacity(0.06 * k * k * shadow * g.opacity);
                     let rect = D2D_RECT_F {
                         left: px.left - grow,
                         top: px.top,
@@ -482,52 +677,6 @@ impl<'a> Canvas<'a> {
             g.rim.SetStartPoint(Vector2 { X: px.left, Y: top });
             g.rim.SetEndPoint(Vector2 { X: px.left, Y: px.bottom });
             self.rt.DrawRoundedRectangle(&rounded(edge, radius * s - inset), &g.rim, s, None);
-        }
-    }
-
-    /// A circular arc with round caps, as a fraction of a full turn starting at 12 o'clock
-    /// and running clockwise (`fraction` 0..=1).
-    pub fn arc(&self, cx: f32, cy: f32, radius: f32, fraction: f32, width: f32, ink: Ink) {
-        let fraction = fraction.clamp(0.0, 1.0);
-        if fraction <= 0.0 {
-            return;
-        }
-        let s = self.scale;
-        let (cx, cy, r) = (self.ox + cx * s, self.oy + cy * s, radius * s);
-        let brush = self.brushes.get(ink);
-        unsafe {
-            if fraction >= 0.9999 {
-                let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: r, radiusY: r };
-                self.rt.DrawEllipse(&e, brush, width * s, None);
-                return;
-            }
-            let Ok(factory) = self.rt.GetFactory() else { return };
-            let Ok(path) = factory.CreatePathGeometry() else { return };
-            let Ok(sink) = path.Open() else { return };
-            let angle = fraction * std::f32::consts::TAU;
-            sink.BeginFigure(Vector2 { X: cx, Y: cy - r }, D2D1_FIGURE_BEGIN_HOLLOW);
-            sink.AddArc(&D2D1_ARC_SEGMENT {
-                point: Vector2 { X: cx + r * angle.sin(), Y: cy - r * angle.cos() },
-                size: D2D_SIZE_F { width: r, height: r },
-                rotationAngle: 0.0,
-                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                arcSize: if fraction > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
-            });
-            sink.EndFigure(D2D1_FIGURE_END_OPEN);
-            if sink.Close().is_err() {
-                return;
-            }
-            let round = D2D1_STROKE_STYLE_PROPERTIES {
-                startCap: D2D1_CAP_STYLE_ROUND,
-                endCap: D2D1_CAP_STYLE_ROUND,
-                dashCap: D2D1_CAP_STYLE_ROUND,
-                lineJoin: D2D1_LINE_JOIN_ROUND,
-                miterLimit: 10.0,
-                dashStyle: D2D1_DASH_STYLE_SOLID,
-                dashOffset: 0.0,
-            };
-            let style = factory.CreateStrokeStyle(&round, None).ok();
-            self.rt.DrawGeometry(&path, brush, width * s, style.as_ref());
         }
     }
 
@@ -587,5 +736,34 @@ impl<'a> Canvas<'a> {
 
     pub fn pop_clip(&self) {
         unsafe { self.rt.PopAxisAlignedClip() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Rgb;
+    use crate::settings::DEFAULT_COLOR;
+
+    #[test]
+    fn hex_round_trips() {
+        assert_eq!(Rgb::from_hex(0x12AB3C), Rgb(0x12, 0xAB, 0x3C));
+        assert_eq!(Rgb(0x12, 0xAB, 0x3C).hex(), 0x12AB3C);
+    }
+
+    #[test]
+    fn default_colour_keeps_the_obsidian_look() {
+        let c = Rgb::from_hex(DEFAULT_COLOR);
+        assert_eq!(c.lighten(0.03), Rgb(18, 16, 25), "gradient top");
+        assert_eq!(c.darken(0.4), Rgb(4, 4, 7), "gradient bottom");
+        assert_eq!(c.glow(), Rgb(122, 92, 230), "violet glow");
+    }
+
+    #[test]
+    fn glow_keeps_the_hue() {
+        let Rgb(r, g, b) = Rgb(20, 60, 30).glow();
+        assert!(g > r && g > b, "green stays green");
+        let Rgb(r, g, b) = Rgb(80, 10, 20).glow();
+        assert!(r > g && r > b, "red stays red");
+        assert_eq!(Rgb(40, 40, 40).glow(), Rgb(230, 230, 236), "grey glows white");
     }
 }

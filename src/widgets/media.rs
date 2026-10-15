@@ -138,6 +138,10 @@ impl Widget for MediaWidget {
         "Media"
     }
 
+    fn icon(&self) -> &'static str {
+        glyph::MUSIC
+    }
+
     fn update(&mut self, _now: Instant) -> bool {
         let mut changed = false;
         if let Some(now) = self.media.poll()

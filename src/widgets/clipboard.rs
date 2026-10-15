@@ -68,6 +68,10 @@ impl Widget for ClipboardWidget {
         "Clipboard"
     }
 
+    fn icon(&self) -> &'static str {
+        glyph::CLIPBOARD
+    }
+
     fn update(&mut self, now: Instant) -> bool {
         let mut changed = false;
         if let Some(watcher) = &self.watcher {
