@@ -16,8 +16,8 @@ use windows::{
         UI::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_F4,
-                VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT,
+                GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN,
+                VK_F4, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
@@ -36,7 +36,7 @@ use crate::icon;
 use crate::settings::Settings;
 use crate::settings_panel::{self, Hit};
 use crate::text::{self, Command, TextField, Utf16Joiner};
-use crate::widgets::{self, Compact, Widget};
+use crate::widgets::{self, Compact, SearchAction, SearchKey, Widget};
 
 const TIMER_FRAME: usize = 1;
 /// How often to check whether a fullscreen app has the foreground.
@@ -392,6 +392,8 @@ struct App {
     keyboard: Option<Keyboard>,
     /// The search field, while search is open.
     search: Option<TextField>,
+    /// The widget showing search results (by index into `widgets`), while searching.
+    results: Option<usize>,
     /// Pairs UTF-16 surrogates from WM_CHAR.
     joiner: Utf16Joiner,
     dirty: bool,
@@ -494,6 +496,7 @@ impl App {
                 interactive: true,
                 keyboard: None,
                 search: None,
+                results: None,
                 joiner: Utf16Joiner::default(),
                 dirty: true,
             })
@@ -621,11 +624,12 @@ impl App {
     }
 
     /// Gives the keyboard up. `restore` hands the foreground back to the window that had it
-    /// (Esc, a tab click); `false` leaves it where it's going (a click elsewhere).
+    /// (Esc, a tab click); `false` leaves it where it's going (a click elsewhere, a launched
+    /// app).
     fn end_typing(&mut self, restore: bool) {
         let Some(kb) = self.keyboard.take() else { return };
         match kb.owner {
-            Owner::Search => self.search = None,
+            Owner::Search => (self.search, self.results) = (None, None),
         }
         self.joiner = Utf16Joiner::default();
         self.dirty = true;
@@ -641,13 +645,47 @@ impl App {
         }
     }
 
-    /// Opens the tab-row search with an empty query and takes the keyboard.
+    /// Opens the tab-row search with an empty query (which shows the pinned apps) and takes
+    /// the keyboard.
     fn open_search(&mut self) {
         self.search = Some(TextField::new(SEARCH_MAX));
-        if !self.begin_typing(Owner::Search) {
+        if self.begin_typing(Owner::Search) {
+            self.query_changed();
+        } else {
             self.search = None;
         }
         self.dirty = true;
+    }
+
+    /// Tells every widget the query changed and shows the first that offers results. All of
+    /// them hear it, so each one's state stays current.
+    fn query_changed(&mut self) {
+        let query = self.search.as_ref().map_or_else(String::new, |field| field.text().to_owned());
+        self.results = None;
+        for (i, w) in self.widgets.iter_mut().enumerate() {
+            if w.search(&query) && self.results.is_none() {
+                self.results = Some(i);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Forwards a navigation key to the widget showing results.
+    fn search_key(&mut self, key: SearchKey) {
+        if let Some(i) = self.results {
+            let action = self.widgets[i].search_key(key);
+            self.search_action(action);
+        }
+    }
+
+    /// Acts on what the results widget did. An opened result closes search without giving
+    /// the focus back, so the app that was launched can come to the front.
+    fn search_action(&mut self, action: SearchAction) {
+        match action {
+            SearchAction::None => {}
+            SearchAction::Redraw => self.dirty = true,
+            SearchAction::Done => self.end_typing(false),
+        }
     }
 
     /// After an edit or a caret move: show the caret solid, and redraw.
@@ -691,6 +729,17 @@ impl App {
         let shift = key_down(VK_SHIFT);
         match owner {
             Owner::Search => {
+                // Down/Up (and Tab) move through the results; Left/Right stay with the caret.
+                let nav = match vk {
+                    _ if vk == VK_DOWN.0 => Some(SearchKey::Next),
+                    _ if vk == VK_UP.0 => Some(SearchKey::Previous),
+                    _ if vk == VK_TAB.0 && !ctrl => Some(if shift { SearchKey::Previous } else { SearchKey::Next }),
+                    _ => None,
+                };
+                if let Some(key) = nav {
+                    self.search_key(key);
+                    return true;
+                }
                 let Some(command) = text::command(vk, ctrl, shift) else { return false };
                 self.search_command(command);
             }
@@ -701,6 +750,7 @@ impl App {
     fn search_command(&mut self, command: Command) {
         let hwnd = self.hwnd;
         let Some(field) = &mut self.search else { return };
+        let before = field.text().to_owned();
         match command {
             Command::Move(motion, extend) => field.move_caret(motion, extend),
             Command::Backspace(word) => field.backspace(word),
@@ -722,13 +772,21 @@ impl App {
                     field.insert(&s);
                 }
             }
-            Command::Submit => {}
+            Command::Submit => {
+                self.search_key(SearchKey::Enter);
+                return;
+            }
             Command::Cancel => {
                 self.end_typing(true);
                 return;
             }
         }
+        // Only a real text change re-runs the search, so caret moves keep the highlight.
+        let changed = self.search.as_ref().is_some_and(|field| field.text() != before);
         self.edited();
+        if changed {
+            self.query_changed();
+        }
     }
 
     /// A typed UTF-16 unit. While the notch holds the keyboard, every char is ours.
@@ -737,12 +795,17 @@ impl App {
         if let Some(c) = self.joiner.push(unit) {
             match owner {
                 Owner::Search => {
-                    if let Some(field) = &mut self.search {
+                    let changed = self.search.as_mut().is_some_and(|field| {
+                        let before = field.text().to_owned();
                         field.insert(c.encode_utf8(&mut [0; 4]));
+                        field.text() != before
+                    });
+                    self.edited();
+                    if changed {
+                        self.query_changed();
                     }
                 }
             }
-            self.edited();
         }
         true
     }
@@ -911,9 +974,14 @@ impl App {
             self.end_typing(true);
             self.select_tab(t);
         } else if self.search.is_some() {
-            // While searching, only the field itself takes clicks: they place the caret.
+            // While searching, only the field (placing the caret) and the results take clicks.
             if field_rect(&self.widgets).contains(lx, ly) {
                 self.place_caret(lx);
+            } else if CONTENT.contains(lx, ly)
+                && let Some(i) = self.results
+            {
+                let action = self.widgets[i].click_search(lx - CONTENT.x, ly - CONTENT.y, CONTENT.w, CONTENT.h);
+                self.search_action(action);
             }
         } else if search_rect(&self.widgets).contains(lx, ly) {
             self.open_search();
@@ -1030,7 +1098,18 @@ impl App {
     /// Mouse wheel, in notches: goes to the open panel. (Windows only sends it while the
     /// cursor is over the notch.)
     fn on_wheel(&mut self, notches: f32) {
-        if self.t < 0.9 || self.active == HOME {
+        if self.t < 0.9 {
+            return;
+        }
+        if self.search.is_some() {
+            if let Some(i) = self.results
+                && self.widgets[i].wheel_search(notches)
+            {
+                self.dirty = true;
+            }
+            return;
+        }
+        if self.active == HOME {
             return;
         }
         if self.active == settings_tab(&self.widgets) {
@@ -1088,8 +1167,13 @@ impl App {
 
                 let content = cv.offset(CONTENT.x, CONTENT.y);
                 if self.search.is_some() {
-                    let all = Rect::new(0.0, 0.0, CONTENT.w, CONTENT.h);
-                    content.text("Type to search apps", Font::Body, Ink::Dim, all, Align::Center);
+                    match self.results {
+                        Some(i) => self.widgets[i].draw_search(&content, CONTENT.w, CONTENT.h),
+                        None => {
+                            let all = Rect::new(0.0, 0.0, CONTENT.w, CONTENT.h);
+                            content.text("Type to search apps", Font::Body, Ink::Dim, all, Align::Center);
+                        }
+                    }
                 } else if self.active == HOME {
                     for (i, r) in home_cards(&self.widgets) {
                         content.fill(r, CARD_RADIUS, Ink::Track);

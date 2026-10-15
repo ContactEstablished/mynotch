@@ -1,5 +1,6 @@
 //! Widgets are the panels hosted by the expanded notch; one is shown at a time, picked by
-//! the tab row. Each also may offer a one-line readout for the collapsed notch.
+//! the tab row. Each also may offer a one-line readout for the collapsed notch, and results
+//! for the tab-row search.
 
 mod apps;
 mod clipboard;
@@ -76,6 +77,28 @@ pub struct Compact {
     pub live: bool,
 }
 
+/// Keys the shell forwards to the widget showing search results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKey {
+    /// Down or Tab: the next result in reading order.
+    Next,
+    /// Up or Shift+Tab.
+    Previous,
+    /// Open the highlighted result.
+    Enter,
+}
+
+/// What a search key or click did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchAction {
+    None,
+    /// The results changed; redraw.
+    Redraw,
+    /// A result was opened (e.g. an app launched): the shell closes search without giving
+    /// the focus back, so what was opened can come to the front.
+    Done,
+}
+
 pub trait Widget {
     /// Name, shown while its tab is hovered or open; also how the last tab is remembered.
     fn title(&self) -> &'static str;
@@ -144,6 +167,33 @@ pub trait Widget {
     /// A left click on the Home card, in card-content coordinates. Returns true when the
     /// widget needs a redraw.
     fn click_card(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) -> bool {
+        false
+    }
+
+    /// The tab-row search's query changed; also called with "" whenever search opens.
+    /// Returns true when this widget offers results for it; the shell shows the first widget
+    /// (in `all()` order) that does. There's no end-of-search call: the next `search`
+    /// replaces whatever state this one kept.
+    fn search(&mut self, _query: &str) -> bool {
+        false
+    }
+
+    /// Draws this widget's search results over the content area, `w` x `h`, at the canvas
+    /// origin.
+    fn draw_search(&self, _cv: &Canvas, _w: f32, _h: f32) {}
+
+    /// A navigation key while this widget's results are shown.
+    fn search_key(&mut self, _key: SearchKey) -> SearchAction {
+        SearchAction::None
+    }
+
+    /// A left click on the results, in content-area coordinates.
+    fn click_search(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) -> SearchAction {
+        SearchAction::None
+    }
+
+    /// Mouse wheel over the results, in notches. Returns true when it needs a redraw.
+    fn wheel_search(&mut self, _notches: f32) -> bool {
         false
     }
 }
