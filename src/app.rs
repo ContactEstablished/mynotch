@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::{
     Win32::{
@@ -21,15 +21,21 @@ use windows::{
     core::*,
 };
 
+use crate::desktop::{self, autostart};
 use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, Ink, Rect, glyph};
+use crate::settings::Settings;
 use crate::widgets::{self, Compact, Widget};
 
 const TIMER_FRAME: usize = 1;
+/// How often to check whether a fullscreen app has the foreground.
+const FULLSCREEN_POLL: Duration = Duration::from_millis(500);
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
 const CMD_PIN: usize = 1;
-const CMD_QUIT: usize = 2;
+const CMD_FULLSCREEN: usize = 2;
+const CMD_AUTOSTART: usize = 3;
+const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
 const COLLAPSED: (f32, f32) = (190.0, 32.0);
@@ -37,6 +43,8 @@ const EXPANDED: (f32, f32) = (520.0, 150.0);
 const RADIUS: f32 = 20.0;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
 const HOVER_MARGIN: f32 = 6.0;
+/// Room around the expanded notch for its drop shadow.
+const SHADOW: f32 = 18.0;
 
 // Expanded layout, in logical units relative to the expanded notch's top-left.
 const PAD: f32 = 24.0;
@@ -109,11 +117,13 @@ impl Drop for Surface {
 /// Rebuilt on `WM_DISPLAYCHANGE` / `WM_DPICHANGED`.
 struct Layout {
     scale: f32,
-    /// Window origin and size (the expanded footprint), in physical screen pixels.
+    /// Window origin and size (the expanded footprint plus shadow room), in physical px.
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+    /// The primary monitor's bounds, for fullscreen detection.
+    monitor: RECT,
     surface: Surface,
     fonts: Fonts,
 }
@@ -129,8 +139,8 @@ impl Layout {
             let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
             let scale = dpi_x as f32 / 96.0;
 
-            let w = (EXPANDED.0 * scale).ceil() as i32;
-            let h = (EXPANDED.1 * scale).ceil() as i32 + 1;
+            let w = ((EXPANDED.0 + SHADOW * 2.0) * scale).ceil() as i32;
+            let h = ((EXPANDED.1 + SHADOW) * scale).ceil() as i32;
             let m = info.rcMonitor;
 
             Ok(Self {
@@ -139,6 +149,7 @@ impl Layout {
                 y: m.top,
                 w,
                 h,
+                monitor: m,
                 surface: Surface::new(w, h)?,
                 fonts: Fonts::new(dwrite, scale)?,
             })
@@ -187,9 +198,17 @@ struct App {
     /// 0.0 = collapsed, 1.0 = expanded.
     t: f32,
     target: f32,
-    pinned: bool,
+    settings: Settings,
+    /// A fullscreen app has the foreground, so the notch is faded out and hidden.
+    hidden: bool,
+    /// Window opacity: 1.0 = shown, 0.0 = faded out.
+    fade: f32,
+    next_fullscreen_check: Instant,
     /// Keeps the notch open while its own context menu is showing.
     menu_open: bool,
+    /// False while the window is click-through (`WS_EX_TRANSPARENT`), i.e. the cursor is
+    /// not over the notch body.
+    interactive: bool,
     dirty: bool,
 }
 
@@ -198,6 +217,9 @@ thread_local! {
 }
 
 pub fn run() -> Result<()> {
+    if !desktop::claim_single_instance() {
+        return Ok(());
+    }
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
@@ -256,6 +278,9 @@ impl App {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let (rt, brushes) = create_target(&d2d)?;
             let layout = Layout::primary(&dwrite)?;
+            let settings = Settings::load();
+            let widgets = widgets::all();
+            let active = widgets.iter().position(|w| w.title() == settings.tab).unwrap_or(0);
 
             Ok(Self {
                 hwnd,
@@ -264,13 +289,17 @@ impl App {
                 rt,
                 brushes,
                 layout,
-                widgets: widgets::all(),
-                active: 0,
+                widgets,
+                active,
                 cursor: None,
                 t: 0.0,
                 target: 0.0,
-                pinned: false,
+                settings,
+                hidden: false,
+                fade: 1.0,
+                next_fullscreen_check: Instant::now(),
                 menu_open: false,
+                interactive: true,
                 dirty: true,
             })
         }
@@ -285,8 +314,25 @@ impl App {
     }
 
     fn toggle_pin(&mut self) {
-        self.pinned = !self.pinned;
+        self.settings.pinned = !self.settings.pinned;
+        self.settings.save();
         self.dirty = true;
+    }
+
+    fn toggle_hide_in_fullscreen(&mut self) {
+        self.settings.hide_in_fullscreen = !self.settings.hide_in_fullscreen;
+        self.settings.save();
+        // Re-evaluate on the next frame rather than waiting for the next poll.
+        self.next_fullscreen_check = Instant::now();
+    }
+
+    fn select_tab(&mut self, i: usize) {
+        if i != self.active {
+            self.active = i;
+            self.settings.tab = self.widgets[i].title().to_string();
+            self.settings.save();
+            self.dirty = true;
+        }
     }
 
     /// The collapsed readout, and the index of the widget providing it.
@@ -315,6 +361,35 @@ impl App {
             }
         }
 
+        // Fade out and hide while a fullscreen app has the foreground; come back after.
+        if now >= self.next_fullscreen_check {
+            self.next_fullscreen_check = now + FULLSCREEN_POLL;
+            let hide = self.settings.hide_in_fullscreen && desktop::foreground_is_fullscreen(self.layout.monitor);
+            if hide != self.hidden {
+                self.hidden = hide;
+                if !hide {
+                    unsafe {
+                        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                    }
+                }
+            }
+        }
+        let fade_target = if self.hidden { 0.0 } else { 1.0 };
+        if self.fade != fade_target {
+            self.fade = approach(self.fade, fade_target, 0.3);
+            self.dirty = true;
+            if self.fade == 0.0 {
+                // Fully faded: hide the window itself, then stop drawing until it returns.
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                self.dirty = false;
+            }
+        }
+        if self.hidden && self.fade == 0.0 {
+            return;
+        }
+
         let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
@@ -323,12 +398,22 @@ impl App {
         let s = l.scale;
         let (nw, nh) = self.notch_size();
         let m = HOVER_MARGIN * s;
-        let left = l.x as f32 + (l.w as f32 - nw) / 2.0 - m;
+        let body_left = l.x as f32 + (l.w as f32 - nw) / 2.0;
+        let left = body_left - m;
         let (px, py) = (pt.x as f32, pt.y as f32);
-        let hovered = px >= left
+        let hovered = !self.hidden
+            && px >= left
             && px < left + nw + m * 2.0
             && py >= l.y as f32
             && py < l.y as f32 + nh + m;
+
+        // Only the body takes clicks; the rest of the window, shadow included, lets them
+        // through to whatever is underneath.
+        let over_body = in_notch(px - body_left, py - l.y as f32, nw, nh, RADIUS * s);
+        if over_body != self.interactive {
+            self.interactive = over_body;
+            set_click_through(self.hwnd, !over_body);
+        }
 
         let cursor = hovered.then(|| ((px - l.x as f32 - l.origin_x()) / s, (py - l.y as f32) / s));
         if cursor != self.cursor {
@@ -338,20 +423,20 @@ impl App {
             }
         }
 
-        let target = if hovered || self.pinned || self.menu_open { 1.0 } else { 0.0 };
+        let target = if hovered || self.settings.pinned || self.menu_open { 1.0 } else { 0.0 };
         if target > self.target && self.t < 0.5 {
-            // Opening from collapsed: show the widget whose readout was on display.
-            if let Some((i, _)) = self.compact() {
-                self.active = i;
-            }
+            // Opening from collapsed: live activity (e.g. music playing) takes the stage;
+            // otherwise the tab the user last picked, else whatever the readout showed.
+            let saved = self.widgets.iter().position(|w| w.title() == self.settings.tab);
+            self.active = match self.compact() {
+                Some((i, c)) if c.live => i,
+                readout => saved.or(readout.map(|(i, _)| i)).unwrap_or(self.active),
+            };
         }
         self.target = target;
 
-        if (self.t - target).abs() > 0.001 {
-            self.t += (target - self.t) * 0.22;
-            if (self.t - target).abs() < 0.005 {
-                self.t = target;
-            }
+        if self.t != target {
+            self.t = approach(self.t, target, 0.22);
             self.dirty = true;
         }
         if self.dirty {
@@ -370,10 +455,7 @@ impl App {
         if PIN.contains(lx, ly) {
             self.toggle_pin();
         } else if let Some(i) = (0..self.widgets.len()).find(|&i| tab_rect(i).contains(lx, ly)) {
-            if i != self.active {
-                self.active = i;
-                self.dirty = true;
-            }
+            self.select_tab(i);
         } else if CONTENT.contains(lx, ly) {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
             if self.widgets[self.active].click(cx, cy, CONTENT.w, CONTENT.h) {
@@ -398,10 +480,11 @@ impl App {
             self.rt.BeginDraw();
             self.rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
 
-            // Body: extend above the window so the top corners stay flat.
+            // Body: extend above the window so the top corners stay flat. The shadow fades in
+            // with expansion and is absent when collapsed, keeping click-through exact.
             let canvas = |origin: f32, cursor| Canvas::new(&self.rt, &self.brushes, &l.fonts, s, (origin, 0.0), cursor);
             let body = canvas(left, None);
-            body.fill(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, Ink::Body);
+            body.glass(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, e);
 
             // Collapsed content: the top-priority widget's one-line readout.
             if e < 0.5
@@ -432,7 +515,7 @@ impl App {
                     cv.text(w.title(), Font::Label, ink, r, Align::Center);
                 }
 
-                let (pin, ink) = match (self.pinned, cv.hovered(PIN)) {
+                let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
                     (true, _) => (glyph::PINNED, Ink::Accent),
                     (false, true) => (glyph::PIN, Ink::Text),
                     (false, false) => (glyph::PIN, Ink::Dim),
@@ -463,7 +546,7 @@ impl App {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: (self.fade * 255.0).round() as u8,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let _ = UpdateLayeredWindow(
@@ -479,6 +562,35 @@ impl App {
             );
         }
     }
+}
+
+/// Whether (`x`, `y`), relative to the body's top-left, is inside a `w` x `h` notch whose
+/// bottom corners are rounded by `r` (the top corners are off-screen).
+fn in_notch(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
+    if x < 0.0 || x >= w || y < 0.0 || y >= h {
+        return false;
+    }
+    let cy = h - r;
+    let cx = if x < r { r } else if x > w - r { w - r } else { return true };
+    if y <= cy {
+        return true;
+    }
+    let (dx, dy) = (x - cx, y - cy);
+    dx * dx + dy * dy <= r * r
+}
+
+fn set_click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let flag = WS_EX_TRANSPARENT.0 as isize;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, if on { style | flag } else { style & !flag });
+    }
+}
+
+/// Eases `v` a fraction `k` of the way to `target`, snapping once close.
+fn approach(v: f32, target: f32, k: f32) -> f32 {
+    let next = v + (target - v) * k;
+    if (next - target).abs() < 0.005 { target } else { next }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -528,19 +640,21 @@ fn tray_remove(hwnd: HWND) {
     }
 }
 
-/// Shows the Pin/Quit menu at the cursor. `TrackPopupMenu` runs a modal loop, so this must
-/// be called without the `APP` borrow held, letting the frame timer keep animating.
+/// Shows the settings/quit menu at the cursor. `TrackPopupMenu` runs a modal loop, so this
+/// must be called without the `APP` borrow held, letting the frame timer keep animating.
 fn show_menu(hwnd: HWND, from_notch: bool) {
-    let mut pinned = false;
+    let mut settings = Settings::default();
     with_app(|a| {
-        pinned = a.pinned;
+        settings = a.settings.clone();
         a.menu_open = from_notch;
     });
 
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let pin_flags = if pinned { MF_STRING | MF_CHECKED } else { MF_STRING };
-        let _ = AppendMenuW(menu, pin_flags, CMD_PIN, w!("Pin open"));
+        let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, check(settings.pinned), CMD_PIN, w!("Pin open"));
+        let _ = AppendMenuW(menu, check(settings.hide_in_fullscreen), CMD_FULLSCREEN, w!("Hide over fullscreen apps"));
+        let _ = AppendMenuW(menu, check(autostart::enabled()), CMD_AUTOSTART, w!("Start with Windows"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Quit MyNotch"));
 
@@ -565,6 +679,10 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
     with_app(|a| a.menu_open = false);
     match cmd {
         CMD_PIN => with_app(|a| a.toggle_pin()),
+        CMD_FULLSCREEN => with_app(|a| a.toggle_hide_in_fullscreen()),
+        CMD_AUTOSTART => {
+            autostart::set(!autostart::enabled());
+        }
         CMD_QUIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
@@ -613,5 +731,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_notch;
+
+    #[test]
+    fn notch_hit_area_follows_rounded_bottom_corners() {
+        let (w, h, r) = (190.0, 32.0, 20.0);
+        assert!(in_notch(95.0, 16.0, w, h, r), "centre");
+        assert!(in_notch(1.0, 1.0, w, h, r), "top-left corner is square");
+        assert!(in_notch(189.0, 1.0, w, h, r), "top-right corner is square");
+        assert!(in_notch(95.0, 31.5, w, h, r), "bottom edge, middle");
+        assert!(!in_notch(1.0, 31.0, w, h, r), "bottom-left corner is rounded off");
+        assert!(!in_notch(189.0, 31.0, w, h, r), "bottom-right corner is rounded off");
+        assert!(in_notch(6.0, 26.0, w, h, r), "just inside the bottom-left curve");
+        assert!(!in_notch(-0.5, 10.0, w, h, r), "left of the body");
+        assert!(!in_notch(95.0, 32.0, w, h, r), "below the body");
     }
 }

@@ -61,7 +61,7 @@ impl Widget for MediaWidget {
         } else {
             format!("♪  {} — {}", now.title, now.artist)
         };
-        Some(Compact { priority: 10, text })
+        Some(Compact { priority: 10, text, live: true })
     }
 
     fn draw(&self, cv: &Canvas, w: f32, h: f32) {

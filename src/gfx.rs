@@ -33,9 +33,10 @@ impl Rect {
     }
 }
 
+/// Content colours. `Track` and `Hover` are translucent white, so controls read as glass
+/// set into the body rather than flat grey.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ink {
-    Body,
     Text,
     Dim,
     Track,
@@ -43,34 +44,74 @@ pub enum Ink {
     Accent,
 }
 
+const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a }
+}
+
+/// The obsidian body material (see `Canvas::glass`). Gradient geometry follows the
+/// animating notch, so it is set on every draw.
+struct Glass {
+    /// Near-black, slightly see-through; lifts a touch towards the top.
+    base: ID2D1LinearGradientBrush,
+    /// Soft reflection of light from the upper left.
+    sheen: ID2D1RadialGradientBrush,
+    /// Faint violet glow in the lower right, like obsidian's sheen.
+    tint: ID2D1RadialGradientBrush,
+    /// Light catching the edge, strongest along the bottom.
+    rim: ID2D1LinearGradientBrush,
+    shadow: ID2D1SolidColorBrush,
+}
+
+impl Glass {
+    unsafe fn new(rt: &ID2D1DCRenderTarget) -> Result<Self> {
+        unsafe {
+            let stops = |colors: &[(f32, D2D1_COLOR_F)]| {
+                let stops: Vec<D2D1_GRADIENT_STOP> =
+                    colors.iter().map(|&(position, color)| D2D1_GRADIENT_STOP { position, color }).collect();
+                rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+            };
+            let linear = |colors: &[(f32, D2D1_COLOR_F)]| -> Result<ID2D1LinearGradientBrush> {
+                rt.CreateLinearGradientBrush(&D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES::default(), None, &stops(colors)?)
+            };
+            let radial = |colors: &[(f32, D2D1_COLOR_F)]| -> Result<ID2D1RadialGradientBrush> {
+                rt.CreateRadialGradientBrush(&D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES::default(), None, &stops(colors)?)
+            };
+            Ok(Self {
+                base: linear(&[(0.0, rgba(17, 17, 24, 0.96)), (1.0, rgba(4, 4, 7, 0.97))])?,
+                sheen: radial(&[(0.0, rgba(255, 255, 255, 0.10)), (1.0, rgba(255, 255, 255, 0.0))])?,
+                tint: radial(&[(0.0, rgba(124, 92, 230, 0.14)), (1.0, rgba(124, 92, 230, 0.0))])?,
+                rim: linear(&[(0.0, rgba(255, 255, 255, 0.04)), (1.0, rgba(255, 255, 255, 0.28))])?,
+                shadow: rt.CreateSolidColorBrush(&rgba(0, 0, 0, 1.0), None)?,
+            })
+        }
+    }
+}
+
 /// Device-dependent brushes; rebuilt together with the render target.
 pub struct Brushes {
-    body: ID2D1SolidColorBrush,
     text: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
     hover: ID2D1SolidColorBrush,
     accent: ID2D1SolidColorBrush,
+    glass: Glass,
 }
 
 impl Brushes {
     pub unsafe fn new(rt: &ID2D1DCRenderTarget) -> Result<Self> {
-        let solid = |r: f32, g: f32, b: f32| unsafe {
-            rt.CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a: 1.0 }, None)
-        };
+        let solid = |c: D2D1_COLOR_F| unsafe { rt.CreateSolidColorBrush(&c, None) };
         Ok(Self {
-            body: solid(0.0, 0.0, 0.0)?,
-            text: solid(0.95, 0.95, 0.95)?,
-            dim: solid(0.6, 0.6, 0.65)?,
-            track: solid(0.2, 0.2, 0.24)?,
-            hover: solid(0.28, 0.28, 0.33)?,
-            accent: solid(0.35, 0.65, 1.0)?,
+            text: solid(rgba(242, 242, 247, 1.0))?,
+            dim: solid(rgba(158, 160, 176, 1.0))?,
+            track: solid(rgba(255, 255, 255, 0.09))?,
+            hover: solid(rgba(255, 255, 255, 0.16))?,
+            accent: solid(rgba(122, 176, 255, 1.0))?,
+            glass: unsafe { Glass::new(rt)? },
         })
     }
 
     fn get(&self, ink: Ink) -> &ID2D1SolidColorBrush {
         match ink {
-            Ink::Body => &self.body,
             Ink::Text => &self.text,
             Ink::Dim => &self.dim,
             Ink::Track => &self.track,
@@ -79,7 +120,7 @@ impl Brushes {
         }
     }
 
-    /// Opacity of every ink except the body, used to fade content in and out.
+    /// Opacity of every content ink (not the body), used to fade content in and out.
     pub fn set_content_opacity(&self, a: f32) {
         unsafe {
             for b in [&self.text, &self.dim, &self.track, &self.hover, &self.accent] {
@@ -289,6 +330,64 @@ impl<'a> Canvas<'a> {
                 Some(w) => self.rt.DrawEllipse(&e, self.brushes.get(ink), w * s, None),
                 None => self.rt.FillEllipse(&e, self.brushes.get(ink)),
             }
+        }
+    }
+
+    /// The notch body in obsidian glass. `r` may extend above y = 0 (to keep the top corners
+    /// off-screen); gradients span only its visible part. `shadow` (0..1) scales a soft drop
+    /// shadow; it must stay 0 while collapsed, since shadow pixels would catch clicks.
+    pub fn glass(&self, r: Rect, radius: f32, shadow: f32) {
+        let g = &self.brushes.glass;
+        let s = self.scale;
+        let px = self.px(r);
+        let top = px.top.max(self.oy);
+        let (w, h) = (px.right - px.left, px.bottom - top);
+        let rounded = |rect: D2D_RECT_F, radius: f32| D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius };
+        let body = rounded(px, radius * s);
+
+        unsafe {
+            // Concentric, increasingly faint layers approximate a blurred shadow.
+            if shadow > 0.0 {
+                const LAYERS: usize = 10;
+                for i in (1..=LAYERS).rev() {
+                    let grow = i as f32 * 1.6 * s;
+                    let k = 1.0 - i as f32 / (LAYERS + 1) as f32;
+                    g.shadow.SetOpacity(0.06 * k * k * shadow);
+                    let rect = D2D_RECT_F {
+                        left: px.left - grow,
+                        top: px.top,
+                        right: px.right + grow,
+                        bottom: px.bottom + grow * 1.2,
+                    };
+                    self.rt.FillRoundedRectangle(&rounded(rect, radius * s + grow), &g.shadow);
+                }
+            }
+
+            g.base.SetStartPoint(Vector2 { X: px.left, Y: top });
+            g.base.SetEndPoint(Vector2 { X: px.left, Y: px.bottom });
+            self.rt.FillRoundedRectangle(&body, &g.base);
+
+            g.sheen.SetCenter(Vector2 { X: px.left + w * 0.28, Y: top });
+            g.sheen.SetRadiusX(w * 0.55);
+            g.sheen.SetRadiusY(h * 0.9);
+            self.rt.FillRoundedRectangle(&body, &g.sheen);
+
+            g.tint.SetCenter(Vector2 { X: px.left + w * 0.85, Y: px.bottom });
+            g.tint.SetRadiusX(w * 0.5);
+            g.tint.SetRadiusY(h * 1.2);
+            self.rt.FillRoundedRectangle(&body, &g.tint);
+
+            // A 1px stroke centred half a pixel inside the edge.
+            let inset = 0.5 * s;
+            let edge = D2D_RECT_F {
+                left: px.left + inset,
+                top: px.top + inset,
+                right: px.right - inset,
+                bottom: px.bottom - inset,
+            };
+            g.rim.SetStartPoint(Vector2 { X: px.left, Y: top });
+            g.rim.SetEndPoint(Vector2 { X: px.left, Y: px.bottom });
+            self.rt.DrawRoundedRectangle(&rounded(edge, radius * s - inset), &g.rim, s, None);
         }
     }
 

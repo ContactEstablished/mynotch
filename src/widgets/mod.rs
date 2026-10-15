@@ -12,6 +12,9 @@ use crate::gfx::Canvas;
 pub struct Compact {
     pub priority: u8,
     pub text: String,
+    /// Live activity (e.g. a song playing): opening the notch then shows this widget instead
+    /// of the last tab the user picked.
+    pub live: bool,
 }
 
 pub trait Widget {
