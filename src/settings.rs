@@ -11,11 +11,13 @@ pub struct Settings {
     pub hide_in_fullscreen: bool,
     /// Title of the last selected tab.
     pub tab: String,
+    /// Length of a focus session (1..=180).
+    pub focus_minutes: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { pinned: false, hide_in_fullscreen: true, tab: String::new() }
+        Self { pinned: false, hide_in_fullscreen: true, tab: String::new(), focus_minutes: 25 }
     }
 }
 
@@ -51,6 +53,11 @@ impl Settings {
                 "pinned" => s.pinned = flag().unwrap_or(s.pinned),
                 "hide_in_fullscreen" => s.hide_in_fullscreen = flag().unwrap_or(s.hide_in_fullscreen),
                 "tab" => s.tab = value.to_string(),
+                "focus_minutes" => {
+                    if let Ok(m) = value.parse::<u32>() {
+                        s.focus_minutes = m.clamp(1, 180);
+                    }
+                }
                 _ => {}
             }
         }
@@ -59,8 +66,8 @@ impl Settings {
 
     fn serialize(&self) -> String {
         format!(
-            "pinned={}\nhide_in_fullscreen={}\ntab={}\n",
-            self.pinned, self.hide_in_fullscreen, self.tab
+            "pinned={}\nhide_in_fullscreen={}\ntab={}\nfocus_minutes={}\n",
+            self.pinned, self.hide_in_fullscreen, self.tab, self.focus_minutes
         )
     }
 }
@@ -75,14 +82,20 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let s = Settings { pinned: true, hide_in_fullscreen: false, tab: "System".into() };
+        let s = Settings { pinned: true, hide_in_fullscreen: false, tab: "System".into(), focus_minutes: 50 };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
 
     #[test]
     fn tolerates_junk_and_unknown_keys() {
-        let s = Settings::parse("pinned = true\nfuture_option=7\nno equals sign\nhide_in_fullscreen=maybe\n");
+        let s = Settings::parse("pinned = true\nfuture_option=7\nno equals sign\nhide_in_fullscreen=maybe\nfocus_minutes=-3\n");
         assert_eq!(s, Settings { pinned: true, ..Settings::default() });
+    }
+
+    #[test]
+    fn focus_minutes_is_clamped() {
+        assert_eq!(Settings::parse("focus_minutes=999").focus_minutes, 180);
+        assert_eq!(Settings::parse("focus_minutes=0").focus_minutes, 1);
     }
 
     #[test]

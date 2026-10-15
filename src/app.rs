@@ -11,10 +11,14 @@ use windows::{
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::*,
         },
+        Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::*,
-            Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW},
+            Shell::{
+                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
+                Shell_NotifyIconW,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -23,12 +27,15 @@ use windows::{
 
 use crate::desktop::{self, autostart};
 use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, Ink, Rect, glyph};
+use crate::icon;
 use crate::settings::Settings;
 use crate::widgets::{self, Compact, Widget};
 
 const TIMER_FRAME: usize = 1;
 /// How often to check whether a fullscreen app has the foreground.
 const FULLSCREEN_POLL: Duration = Duration::from_millis(500);
+/// How long the notch pops open when a widget asks for attention.
+const PEEK: Duration = Duration::from_secs(6);
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
@@ -206,6 +213,10 @@ struct App {
     next_fullscreen_check: Instant,
     /// Keeps the notch open while its own context menu is showing.
     menu_open: bool,
+    /// Keeps the notch open until then, after a widget asked for attention.
+    peek_until: Option<Instant>,
+    /// The tray (and window) icon we drew; `None` falls back to the stock application icon.
+    icon: Option<HICON>,
     /// False while the window is click-through (`WS_EX_TRANSPARENT`), i.e. the cursor is
     /// not over the notch body.
     interactive: bool,
@@ -253,9 +264,9 @@ pub fn run() -> Result<()> {
 
         let mut app = App::new(hwnd)?;
         app.render();
+        app.refresh_icon(NIM_ADD);
         APP.with(|a| *a.borrow_mut() = Some(app));
 
-        tray_add(hwnd);
         SetTimer(Some(hwnd), TIMER_FRAME, 16, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -279,7 +290,10 @@ impl App {
             let (rt, brushes) = create_target(&d2d)?;
             let layout = Layout::primary(&dwrite)?;
             let settings = Settings::load();
-            let widgets = widgets::all();
+            let mut widgets = widgets::all();
+            for w in &mut widgets {
+                w.load(&settings);
+            }
             let active = widgets.iter().position(|w| w.title() == settings.tab).unwrap_or(0);
 
             Ok(Self {
@@ -298,6 +312,8 @@ impl App {
                 hidden: false,
                 fade: 1.0,
                 next_fullscreen_check: Instant::now(),
+                peek_until: None,
+                icon: None,
                 menu_open: false,
                 interactive: true,
                 dirty: true,
@@ -310,6 +326,29 @@ impl App {
         if let Ok(layout) = unsafe { Layout::primary(&self.dwrite) } {
             self.layout = layout;
             self.render();
+            self.refresh_icon(NIM_MODIFY);
+        }
+    }
+
+    /// Redraws the icon for the current DPI and taskbar theme, then adds (`NIM_ADD`) or
+    /// updates (`NIM_MODIFY`) the tray icon and sets it as the window icon too.
+    fn refresh_icon(&mut self, op: NOTIFY_ICON_MESSAGE) {
+        let dpi = (self.layout.scale * 96.0).round() as u32;
+        let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) };
+        if let Ok(icon) = icon::render(&self.d2d, size, desktop::taskbar_is_light()) {
+            // Hand out the new icon before destroying the old one, so nothing shows a dead handle.
+            tray_notify(self.hwnd, op, icon);
+            unsafe {
+                for kind in [ICON_SMALL, ICON_BIG] {
+                    SendMessageW(self.hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
+                }
+                if let Some(old) = self.icon.replace(icon) {
+                    let _ = DestroyIcon(old);
+                }
+            }
+        } else {
+            let fallback = self.icon.or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION) }.ok());
+            tray_notify(self.hwnd, op, fallback.unwrap_or_default());
         }
     }
 
@@ -359,6 +398,17 @@ impl App {
             if w.update(now) {
                 self.dirty = true;
             }
+        }
+        if let Some(i) = self.widgets.iter_mut().position(|w| w.take_attention()) {
+            // E.g. a focus session ended: pop open on that widget, with a chime.
+            self.active = i;
+            self.peek_until = Some(now + PEEK);
+            unsafe {
+                let _ = PlaySoundW(w!("Notification.Reminder"), None, SND_ALIAS | SND_ASYNC);
+            }
+        }
+        if self.peek_until.is_some_and(|until| now >= until) {
+            self.peek_until = None;
         }
 
         // Fade out and hide while a fullscreen app has the foreground; come back after.
@@ -423,7 +473,8 @@ impl App {
             }
         }
 
-        let target = if hovered || self.settings.pinned || self.menu_open { 1.0 } else { 0.0 };
+        let peeking = self.peek_until.is_some();
+        let target = if hovered || self.settings.pinned || self.menu_open || peeking { 1.0 } else { 0.0 };
         if target > self.target && self.t < 0.5 {
             // Opening from collapsed: live activity (e.g. music playing) takes the stage;
             // otherwise the tab the user last picked, else whatever the readout showed.
@@ -460,6 +511,11 @@ impl App {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
             if self.widgets[self.active].click(cx, cy, CONTENT.w, CONTENT.h) {
                 self.dirty = true;
+                let before = self.settings.clone();
+                self.widgets[self.active].store(&mut self.settings);
+                if self.settings != before {
+                    self.settings.save();
+                }
             }
         }
     }
@@ -612,31 +668,22 @@ fn with_app(f: impl FnOnce(&mut App)) {
     });
 }
 
-fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+/// Adds, updates or removes (`NIM_DELETE`, where `icon` is ignored) the tray icon.
+fn tray_notify(hwnd: HWND, op: NOTIFY_ICON_MESSAGE, icon: HICON) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ID,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+        hIcon: icon,
         ..Default::default()
     };
     for (dst, src) in nid.szTip.iter_mut().zip("MyNotch".encode_utf16()) {
         *dst = src;
     }
-    nid
-}
-
-fn tray_add(hwnd: HWND) {
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd));
-    }
-}
-
-fn tray_remove(hwnd: HWND) {
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+        let _ = Shell_NotifyIconW(op, &nid);
     }
 }
 
@@ -721,13 +768,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // Light/dark theme switched: redraw the tray icon to match the taskbar.
+        WM_SETTINGCHANGE if lparam.0 != 0 && unsafe { PCWSTR(lparam.0 as *const u16).to_string() }
+            .is_ok_and(|s| s == "ImmersiveColorSet") =>
+        {
+            with_app(|a| a.refresh_icon(NIM_MODIFY));
+            LRESULT(0)
+        }
         WM_DESTROY => {
-            tray_remove(hwnd);
+            tray_notify(hwnd, NIM_DELETE, HICON::default());
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         _ if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
-            tray_add(hwnd);
+            with_app(|a| a.refresh_icon(NIM_ADD));
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

@@ -1,12 +1,14 @@
 //! Widgets are the panels hosted by the expanded notch; one is shown at a time, picked by
 //! the tab row. Each also may offer a one-line readout for the collapsed notch.
 
+mod focus;
 mod media;
 mod system;
 
 use std::time::Instant;
 
 use crate::gfx::Canvas;
+use crate::settings::Settings;
 
 /// A one-line readout for the collapsed notch. The widget with the highest `priority` wins.
 pub struct Compact {
@@ -35,9 +37,26 @@ pub trait Widget {
     fn click(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) -> bool {
         false
     }
+
+    /// Restores this widget's preferences. Called once at startup.
+    fn load(&mut self, _settings: &Settings) {}
+
+    /// Copies this widget's preferences into `settings`; the shell saves the file if
+    /// anything changed. Called after a click the widget handled.
+    fn store(&self, _settings: &mut Settings) {}
+
+    /// True once when the widget wants to be seen (e.g. a timer just finished): the notch
+    /// briefly opens on it and plays a sound.
+    fn take_attention(&mut self) -> bool {
+        false
+    }
 }
 
 /// Every widget, in tab order.
 pub fn all() -> Vec<Box<dyn Widget>> {
-    vec![Box::new(media::MediaWidget::new()), Box::new(system::SystemWidget::new())]
+    vec![
+        Box::new(media::MediaWidget::new()),
+        Box::new(focus::FocusWidget::new()),
+        Box::new(system::SystemWidget::new()),
+    ]
 }

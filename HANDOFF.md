@@ -19,16 +19,19 @@ BuildNotch's feature set (reference for future milestones):
 - **Milestone 1 scope:** overlay shell + live system stats (CPU/RAM). Proves the hard part (transparent, always-on-top, hover-animated window) first.
 - **Milestone 2 scope:** widget system + media controls (SMTC). The System stats moved onto the widget system.
 - **Polish pass (after M2):** obsidian glass look, fullscreen auto-hide, Start with Windows, saved settings, network speed, single instance. Done before adding more widgets.
+- **Milestone 3:** Pomodoro focus timer widget + a runtime-drawn, theme-aware tray icon.
 
-## Current state — Milestone 2 + polish (branch `milestone-2`; polish and glass uncommitted)
+## Current state — Milestone 3 (branch `milestone-3`, uncommitted; `milestone-2` holds M2 + polish, pushed)
 Builds clean (`cargo build`, `cargo clippy --all-targets`: no warnings; `cargo test`: 7 passing). A release build is left running from `target\release\mynotch.exe`, so normal debug `cargo build`/`cargo run` aren't blocked by a locked exe. Quit it from the menu before `cargo build --release`.
 
-**What it does.** The collapsed notch shows a one-line readout: the current track while media plays, otherwise CPU/RAM. Hovering opens it with tabs (Media, System) and a pin. Opening goes to Media while something is playing, otherwise to the last tab you picked.
+**What it does.** The collapsed notch shows a one-line readout: a running focus timer ("Focus 24:13"), else the current track while media plays, else a paused timer, else CPU/RAM. Hovering opens it with tabs (Media, Focus, System) and a pin. Opening goes to the live activity (running timer or playing media), otherwise to the last tab you picked.
 - **Media:** title, artist, source app, previous/play-pause/next (via SMTC).
+- **Focus:** Pomodoro timer: focus 15/25/50 min (chips, saved), 5 min short break, 15 min long break after every 4 sessions. A ring empties as the phase runs (blue for focus, teal for breaks), with dots for the sessions done this cycle; there are reset, start/pause and skip buttons. When a phase ends, the notch pops open on Focus for 6 s (`PEEK`) and plays the `Notification.Reminder` sound. The next phase waits for you to press play.
 - **System:** CPU and RAM bars, plus NET (↓/↑ throughput).
+- **Tray icon:** drawn at runtime (`icon.rs`) at the DPI-correct small-icon size: a screen outline (white on a dark taskbar, near-black on a light one) with a blue-violet notch. It is redrawn on theme change (`WM_SETTINGCHANGE` "ImmersiveColorSet"), DPI change and Explorer restart, and also set as the window icon.
 - **Look:** painted obsidian glass (near-black see-through gradient, upper-left reflection, violet sheen, bottom rim light, shadow when open); controls are translucent white.
 - **Menu** (right-click the notch or the tray icon): Pin open, Hide over fullscreen apps (default on), Start with Windows (default off; writes `HKCU\...\Run\MyNotch` = the running exe's path), Quit.
-- **Settings** in `%APPDATA%\MyNotch\settings.ini` (`pinned`, `hide_in_fullscreen`, `tab`). Start with Windows lives only in the registry.
+- **Settings** in `%APPDATA%\MyNotch\settings.ini` (`pinned`, `hide_in_fullscreen`, `tab`, `focus_minutes`). Start with Windows lives only in the registry.
 - **One instance only** (`Local\MyNotch.SingleInstance` mutex); a second launch exits silently.
 
 **Verified** on the dev machine (5120-wide primary monitor, 100% scale), via scripts that post messages to the window and take screenshots:
@@ -36,7 +39,8 @@ Builds clean (`cargo build`, `cargo clippy --all-targets`: no warnings; `cargo t
 - Click routing at the real cursor position: the body takes clicks; shadow, rounded corners, and everything when the cursor is elsewhere (even pinned) pass through. Hover-to-expand works.
 - Polish: second instance exits; pin and picked tab survive a restart; the menu toggles work (Start with Windows adds and removes the Run value; the fullscreen toggle is saved); a borderless window covering the monitor hides the notch (fade out, then `SW_HIDE`); a maximized window doesn't; it comes back when the fullscreen window closes; with hiding off it stays.
 - Tray icon register/remove, display-change relayout, menu Quit. Idle cost about 0.6% of one core (debug).
-- Not tested: button/tab hover highlights, Next/Previous against a real player, a real DPI change, an Explorer restart, a real game in exclusive fullscreen.
+- Milestone 3 (scripted, saving and restoring the real settings file): Focus tab idle/running/break visuals; chips save `focus_minutes`; the collapsed readout shows the running timer above playing media; a real 1-minute session ended and popped the notch open on Focus showing the break. Tray icon registered and set as the window icon; its 16 px pixels checked (opaque, crisp outline, clear inside) on a dark taskbar.
+- Not tested: whether the end-of-session sound is audible, the light-taskbar icon variant, live theme switching, button/tab hover highlights, Next/Previous against a real player, a real DPI change, an Explorer restart, a real game in exclusive fullscreen.
 
 | File | Purpose |
 |---|---|
@@ -46,7 +50,10 @@ Builds clean (`cargo build`, `cargo clippy --all-targets`: no warnings; `cargo t
 | `src/gfx.rs` | `Canvas` (logical-unit drawing: text, fills, circles, clip, hover test, `glass()` for the obsidian body), `Brushes`/`Ink` (+ `Glass` gradient brushes), `Fonts`/`Font`, icon `glyph`s, `Rect` |
 | `src/desktop.rs` | Single-instance guard, `autostart` (Run key), `foreground_is_fullscreen` (unit-tested rule: covers the monitor, not maximized, not the desktop) |
 | `src/settings.rs` | `Settings` load/save as `key=value` lines; tolerant parser (unit-tested) |
-| `src/widgets/mod.rs` | `Widget` trait, `Compact` readout (`priority`, `live`), `all()` registry (tab order) |
+| `src/timer.rs` | Pomodoro state machine (`Timer`, `Phase`); time is passed in (unit-tested) |
+| `src/icon.rs` | Draws the tray icon with D2D into a DIB, un-premultiplies the alpha, `CreateIconIndirect` |
+| `src/widgets/focus.rs` | Focus timer panel: ring, digits, label, chips, controls |
+| `src/widgets/mod.rs` | `Widget` trait (+ `load`/`store` for settings, `take_attention` to pop open), `Compact` readout (`priority`, `live`), `all()` registry (tab order) |
 | `src/widgets/media.rs` | Now-playing panel and transport buttons |
 | `src/widgets/system.rs` | CPU/RAM bars and NET throughput (samples every 1 s; "–" until the first valid sample); `rate()` formatter (unit-tested) |
 | `src/media.rs` | SMTC worker thread: polls every 500 ms, runs commands, talks to the UI over channels. `app_name()` turns an AUMID into a friendly name (unit-tested) |
@@ -73,6 +80,7 @@ Builds clean (`cargo build`, `cargo clippy --all-targets`: no warnings; `cargo t
 - Network throughput sums all non-loopback interfaces, so traffic through virtual adapters (VPN, WSL/Hyper-V) can be counted twice.
 - Only the primary monitor is supported (by design for now). Fullscreen apps on other monitors don't hide the notch.
 - Opening the menu takes foreground from the active app (standard tray-menu behavior).
-- Generic `IDI_APPLICATION` tray icon; needs a real icon resource.
+- The exe itself still has the default icon in Explorer/Task Manager (embedding one needs a resource compiler step, e.g. `embed-resource` in `build.rs`).
+- Focus timer: the 7 visual themes BuildNotch offers (Clean, Pixel, Dusk, Dots, Retro Clock, Terminal, Cyber HUD) aren't built yet; this is the "Clean" look. Breaks don't auto-start, and a running timer doesn't survive a restart.
 - Repo: `origin` = github.com/ContactEstablished/mynotch, default branch `main`.
-- Next features (agreed order: polish, then the focus timer): focus timer + themes, album art/progress, app shortcuts, AI-app detection + usage, clipboard history, GitHub activity, notes/tasks/code playground (these need text input inside the notch).
+- Next features: timer themes, album art/progress, app shortcuts, AI-app detection + usage, clipboard history, GitHub activity, notes/tasks/code playground (these need text input inside the notch).

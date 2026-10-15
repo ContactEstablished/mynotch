@@ -42,6 +42,8 @@ pub enum Ink {
     Track,
     Hover,
     Accent,
+    /// Teal, for rest (timer breaks).
+    Calm,
 }
 
 const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
@@ -94,6 +96,7 @@ pub struct Brushes {
     track: ID2D1SolidColorBrush,
     hover: ID2D1SolidColorBrush,
     accent: ID2D1SolidColorBrush,
+    calm: ID2D1SolidColorBrush,
     glass: Glass,
 }
 
@@ -106,6 +109,7 @@ impl Brushes {
             track: solid(rgba(255, 255, 255, 0.09))?,
             hover: solid(rgba(255, 255, 255, 0.16))?,
             accent: solid(rgba(122, 176, 255, 1.0))?,
+            calm: solid(rgba(102, 214, 184, 1.0))?,
             glass: unsafe { Glass::new(rt)? },
         })
     }
@@ -117,13 +121,14 @@ impl Brushes {
             Ink::Track => &self.track,
             Ink::Hover => &self.hover,
             Ink::Accent => &self.accent,
+            Ink::Calm => &self.calm,
         }
     }
 
     /// Opacity of every content ink (not the body), used to fade content in and out.
     pub fn set_content_opacity(&self, a: f32) {
         unsafe {
-            for b in [&self.text, &self.dim, &self.track, &self.hover, &self.accent] {
+            for b in [&self.text, &self.dim, &self.track, &self.hover, &self.accent, &self.calm] {
                 b.SetOpacity(a);
             }
         }
@@ -144,6 +149,8 @@ pub enum Font {
     IconMedium,
     /// 24px icon glyphs.
     IconLarge,
+    /// 32px light, for big numbers.
+    Display,
 }
 
 /// Glyphs from Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10); the
@@ -156,6 +163,7 @@ pub mod glyph {
     pub const MUSIC: &str = "\u{E8D6}";
     pub const PIN: &str = "\u{E718}";
     pub const PINNED: &str = "\u{E842}";
+    pub const RESET: &str = "\u{E72C}";
 }
 
 /// Single-line text formats (no wrapping, ellipsis on overflow), sized for one DPI scale.
@@ -166,6 +174,7 @@ pub struct Fonts {
     icon: IDWriteTextFormat,
     icon_medium: IDWriteTextFormat,
     icon_large: IDWriteTextFormat,
+    display: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -201,6 +210,7 @@ impl Fonts {
                 icon: make(icons, 16.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 icon_medium: make(icons, 20.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 icon_large: make(icons, 24.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                display: make(ui, 32.0, DWRITE_FONT_WEIGHT_LIGHT)?,
             })
         }
     }
@@ -213,6 +223,7 @@ impl Fonts {
             Font::Icon => &self.icon,
             Font::IconMedium => &self.icon_medium,
             Font::IconLarge => &self.icon_large,
+            Font::Display => &self.display,
         }
     }
 }
@@ -388,6 +399,52 @@ impl<'a> Canvas<'a> {
             g.rim.SetStartPoint(Vector2 { X: px.left, Y: top });
             g.rim.SetEndPoint(Vector2 { X: px.left, Y: px.bottom });
             self.rt.DrawRoundedRectangle(&rounded(edge, radius * s - inset), &g.rim, s, None);
+        }
+    }
+
+    /// A circular arc with round caps, as a fraction of a full turn starting at 12 o'clock
+    /// and running clockwise (`fraction` 0..=1).
+    pub fn arc(&self, cx: f32, cy: f32, radius: f32, fraction: f32, width: f32, ink: Ink) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        if fraction <= 0.0 {
+            return;
+        }
+        let s = self.scale;
+        let (cx, cy, r) = (self.ox + cx * s, self.oy + cy * s, radius * s);
+        let brush = self.brushes.get(ink);
+        unsafe {
+            if fraction >= 0.9999 {
+                let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: r, radiusY: r };
+                self.rt.DrawEllipse(&e, brush, width * s, None);
+                return;
+            }
+            let Ok(factory) = self.rt.GetFactory() else { return };
+            let Ok(path) = factory.CreatePathGeometry() else { return };
+            let Ok(sink) = path.Open() else { return };
+            let angle = fraction * std::f32::consts::TAU;
+            sink.BeginFigure(Vector2 { X: cx, Y: cy - r }, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 { X: cx + r * angle.sin(), Y: cy - r * angle.cos() },
+                size: D2D_SIZE_F { width: r, height: r },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if fraction > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            if sink.Close().is_err() {
+                return;
+            }
+            let round = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                miterLimit: 10.0,
+                dashStyle: D2D1_DASH_STYLE_SOLID,
+                dashOffset: 0.0,
+            };
+            let style = factory.CreateStrokeStyle(&round, None).ok();
+            self.rt.DrawGeometry(&path, brush, width * s, style.as_ref());
         }
     }
 

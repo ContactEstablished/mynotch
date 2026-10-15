@@ -5,7 +5,9 @@ use windows::{
     Win32::{
         Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, RECT},
         System::{
-            Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
+            Registry::{
+                HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+            },
             Threading::CreateMutexW,
         },
         UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsZoomed},
@@ -49,6 +51,23 @@ pub mod autostart {
             RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, VALUE, REG_SZ.0, Some(command.as_ptr().cast()), bytes)
                 == ERROR_SUCCESS
         }
+    }
+}
+
+/// Whether the taskbar uses the light theme (Settings > Personalization > Colors).
+pub fn taskbar_is_light() -> bool {
+    let (mut value, mut size) = (0u32, size_of::<u32>() as u32);
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        ) == ERROR_SUCCESS
+            && value != 0
     }
 }
 
