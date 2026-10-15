@@ -26,7 +26,7 @@ use windows::{
 };
 
 use crate::desktop::{self, autostart};
-use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, Ink, Rect, glyph};
+use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Rect, glyph};
 use crate::icon;
 use crate::settings::Settings;
 use crate::widgets::{self, Compact, Widget};
@@ -46,8 +46,8 @@ const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
 const COLLAPSED: (f32, f32) = (190.0, 32.0);
-const EXPANDED: (f32, f32) = (520.0, 150.0);
-const RADIUS: f32 = 20.0;
+const EXPANDED: (f32, f32) = (720.0, 240.0);
+const RADIUS: f32 = 24.0;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
 const HOVER_MARGIN: f32 = 6.0;
 /// Room around the expanded notch for its drop shadow.
@@ -56,14 +56,47 @@ const SHADOW: f32 = 18.0;
 // Expanded layout, in logical units relative to the expanded notch's top-left.
 const PAD: f32 = 24.0;
 const TAB_Y: f32 = 12.0;
-const TAB_W: f32 = 72.0;
+const TAB_W: f32 = 80.0;
 const TAB_H: f32 = 24.0;
 const TAB_GAP: f32 = 4.0;
 const PIN: Rect = Rect::new(EXPANDED.0 - PAD - TAB_H, TAB_Y, TAB_H, TAB_H);
-const CONTENT: Rect = Rect::new(PAD, 44.0, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - 44.0 - 12.0);
+const CONTENT: Rect = Rect::new(PAD, 48.0, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - 48.0 - 16.0);
+// Home dashboard cards.
+const CARD_GAP: f32 = 12.0;
+const CARD_PAD: f32 = 14.0;
+const CARD_RADIUS: f32 = 16.0;
+
+/// Tab 0 is the Home dashboard; widget `i` is tab `i + 1`.
+const HOME: usize = 0;
 
 fn tab_rect(i: usize) -> Rect {
     Rect::new(PAD + i as f32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
+}
+
+fn tab_title(widgets: &[Box<dyn Widget>], tab: usize) -> &'static str {
+    if tab == HOME { "Home" } else { widgets[tab - 1].title() }
+}
+
+fn tab_named(widgets: &[Box<dyn Widget>], title: &str) -> Option<usize> {
+    (0..=widgets.len()).find(|&t| tab_title(widgets, t) == title)
+}
+
+/// Home dashboard cards as (widget index, rect in content coordinates), sized by weight.
+fn home_cards(widgets: &[Box<dyn Widget>]) -> Vec<(usize, Rect)> {
+    let weighted: Vec<(usize, f32)> =
+        widgets.iter().enumerate().filter_map(|(i, w)| w.card_weight().map(|k| (i, k))).collect();
+    let total: f32 = weighted.iter().map(|(_, k)| k).sum();
+    let free = CONTENT.w - CARD_GAP * weighted.len().saturating_sub(1) as f32;
+    let mut x = 0.0;
+    weighted
+        .into_iter()
+        .map(|(i, k)| {
+            let w = free * k / total;
+            let card = (i, Rect::new(x, 0.0, w, CONTENT.h));
+            x += w + CARD_GAP;
+            card
+        })
+        .collect()
 }
 
 /// Broadcast by Explorer when the taskbar is (re)created; the tray icon must be re-added.
@@ -196,9 +229,10 @@ struct App {
     dwrite: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
     brushes: Brushes,
+    images: ImageCache,
     layout: Layout,
     widgets: Vec<Box<dyn Widget>>,
-    /// Index of the widget shown when expanded.
+    /// The tab shown when expanded: `HOME`, or widget `i` as `i + 1`.
     active: usize,
     /// Cursor in expanded-layout logical coordinates while it is over the notch.
     cursor: Option<(f32, f32)>,
@@ -294,7 +328,7 @@ impl App {
             for w in &mut widgets {
                 w.load(&settings);
             }
-            let active = widgets.iter().position(|w| w.title() == settings.tab).unwrap_or(0);
+            let active = tab_named(&widgets, &settings.tab).unwrap_or(HOME);
 
             Ok(Self {
                 hwnd,
@@ -302,6 +336,7 @@ impl App {
                 dwrite,
                 rt,
                 brushes,
+                images: ImageCache::default(),
                 layout,
                 widgets,
                 active,
@@ -368,7 +403,7 @@ impl App {
     fn select_tab(&mut self, i: usize) {
         if i != self.active {
             self.active = i;
-            self.settings.tab = self.widgets[i].title().to_string();
+            self.settings.tab = tab_title(&self.widgets, i).to_string();
             self.settings.save();
             self.dirty = true;
         }
@@ -394,14 +429,17 @@ impl App {
     /// Per-frame: widget updates, hover detection and animation.
     fn tick(&mut self) {
         let now = Instant::now();
+        let mut updated = false;
         for w in &mut self.widgets {
-            if w.update(now) {
-                self.dirty = true;
-            }
+            updated |= w.update(now);
+        }
+        if updated {
+            self.dirty = true;
+            self.persist_widgets();
         }
         if let Some(i) = self.widgets.iter_mut().position(|w| w.take_attention()) {
             // E.g. a focus session ended: pop open on that widget, with a chime.
-            self.active = i;
+            self.active = i + 1;
             self.peek_until = Some(now + PEEK);
             unsafe {
                 let _ = PlaySoundW(w!("Notification.Reminder"), None, SND_ALIAS | SND_ASYNC);
@@ -476,12 +514,13 @@ impl App {
         let peeking = self.peek_until.is_some();
         let target = if hovered || self.settings.pinned || self.menu_open || peeking { 1.0 } else { 0.0 };
         if target > self.target && self.t < 0.5 {
-            // Opening from collapsed: live activity (e.g. music playing) takes the stage;
-            // otherwise the tab the user last picked, else whatever the readout showed.
-            let saved = self.widgets.iter().position(|w| w.title() == self.settings.tab);
-            self.active = match self.compact() {
-                Some((i, c)) if c.live => i,
-                readout => saved.or(readout.map(|(i, _)| i)).unwrap_or(self.active),
+            // Opening from collapsed: Home if that's where the user left it (it shows the live
+            // activity anyway); else live activity (music, a running timer) takes the stage;
+            // else the tab the user last picked; else Home.
+            self.active = match (tab_named(&self.widgets, &self.settings.tab), self.compact()) {
+                (Some(HOME), _) => HOME,
+                (_, Some((i, c))) if c.live => i + 1,
+                (saved, _) => saved.unwrap_or(HOME),
             };
         }
         self.target = target;
@@ -505,18 +544,42 @@ impl App {
 
         if PIN.contains(lx, ly) {
             self.toggle_pin();
-        } else if let Some(i) = (0..self.widgets.len()).find(|&i| tab_rect(i).contains(lx, ly)) {
-            self.select_tab(i);
+        } else if let Some(t) = (0..=self.widgets.len()).find(|&t| tab_rect(t).contains(lx, ly)) {
+            self.select_tab(t);
         } else if CONTENT.contains(lx, ly) {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
-            if self.widgets[self.active].click(cx, cy, CONTENT.w, CONTENT.h) {
+            let handled = if self.active == HOME {
+                home_cards(&self.widgets).into_iter().find(|(_, r)| r.contains(cx, cy)).map(|(i, r)| {
+                    let (x, y) = (cx - r.x - CARD_PAD, cy - r.y - CARD_PAD);
+                    (i, self.widgets[i].click_card(x, y, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0))
+                })
+            } else {
+                let i = self.active - 1;
+                Some((i, self.widgets[i].click(cx, cy, CONTENT.w, CONTENT.h)))
+            };
+            if let Some((_, true)) = handled {
                 self.dirty = true;
-                let before = self.settings.clone();
-                self.widgets[self.active].store(&mut self.settings);
-                if self.settings != before {
-                    self.settings.save();
-                }
+                self.persist_widgets();
             }
+        }
+    }
+
+    /// Saves the settings file if any widget's preferences changed.
+    fn persist_widgets(&mut self) {
+        let before = self.settings.clone();
+        for w in &self.widgets {
+            w.store(&mut self.settings);
+        }
+        if self.settings != before {
+            self.settings.save();
+        }
+    }
+
+    /// Mouse wheel, in notches: goes to the open panel. (Windows only sends it while the
+    /// cursor is over the notch.)
+    fn on_wheel(&mut self, notches: f32) {
+        if self.t >= 0.9 && self.active != HOME && self.widgets[self.active - 1].wheel(notches) {
+            self.dirty = true;
         }
     }
 
@@ -538,7 +601,8 @@ impl App {
 
             // Body: extend above the window so the top corners stay flat. The shadow fades in
             // with expansion and is absent when collapsed, keeping click-through exact.
-            let canvas = |origin: f32, cursor| Canvas::new(&self.rt, &self.brushes, &l.fonts, s, (origin, 0.0), cursor);
+            let canvas =
+                |origin: f32, cursor| Canvas::new(&self.rt, &self.brushes, &l.fonts, &self.images, s, (origin, 0.0), cursor);
             let body = canvas(left, None);
             body.glass(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, e);
 
@@ -558,9 +622,9 @@ impl App {
                 let cv = canvas(ox, self.cursor);
                 cv.push_clip(Rect::new((left - ox) / s, 0.0, nw / s, nh / s));
 
-                for (i, w) in self.widgets.iter().enumerate() {
-                    let r = tab_rect(i);
-                    let ink = if i == self.active {
+                for t in 0..=self.widgets.len() {
+                    let r = tab_rect(t);
+                    let ink = if t == self.active {
                         cv.fill(r, TAB_H / 2.0, Ink::Track);
                         Ink::Text
                     } else if cv.hovered(r) {
@@ -568,7 +632,7 @@ impl App {
                     } else {
                         Ink::Dim
                     };
-                    cv.text(w.title(), Font::Label, ink, r, Align::Center);
+                    cv.text(tab_title(&self.widgets, t), Font::Label, ink, r, Align::Center);
                 }
 
                 let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
@@ -578,7 +642,16 @@ impl App {
                 };
                 cv.text(pin, Font::Icon, ink, PIN, Align::Center);
 
-                self.widgets[self.active].draw(&cv.offset(CONTENT.x, CONTENT.y), CONTENT.w, CONTENT.h);
+                let content = cv.offset(CONTENT.x, CONTENT.y);
+                if self.active == HOME {
+                    for (i, r) in home_cards(&self.widgets) {
+                        content.fill(r, CARD_RADIUS, Ink::Track);
+                        let inner = content.offset(r.x + CARD_PAD, r.y + CARD_PAD);
+                        self.widgets[i].draw_card(&inner, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0);
+                    }
+                } else {
+                    self.widgets[self.active - 1].draw(&content, CONTENT.w, CONTENT.h);
+                }
                 cv.pop_clip();
             }
 
@@ -589,6 +662,7 @@ impl App {
                     if let Ok((rt, brushes)) = create_target(&self.d2d) {
                         self.rt = rt;
                         self.brushes = brushes;
+                        self.images.clear();
                     }
                     self.dirty = true;
                     return;
@@ -753,6 +827,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_RBUTTONUP => {
             show_menu(hwnd, true);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            with_app(|a| a.on_wheel(f32::from(delta) / WHEEL_DELTA as f32));
             LRESULT(0)
         }
         WM_TRAY => {

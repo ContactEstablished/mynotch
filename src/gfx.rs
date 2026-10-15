@@ -1,14 +1,71 @@
 //! Drawing primitives shared by the shell and widgets. Widgets lay out in logical (96-DPI)
 //! units relative to their own origin; `Canvas` maps that onto physical pixels.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::{
     Win32::Graphics::{
         Direct2D::{Common::*, *},
         DirectWrite::*,
+        Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
     },
     core::*,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
+
+/// Decoded pixels (premultiplied BGRA, top-down) that any thread can produce and share as
+/// `Arc<Image>`. The UI turns them into Direct2D bitmaps on demand (see `ImageCache`).
+pub struct Image {
+    id: u64,
+    pub width: u32,
+    pub height: u32,
+    pixels: Vec<u8>,
+}
+
+impl Image {
+    /// `pixels` must hold `width * height` premultiplied BGRA pixels.
+    pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Option<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        (width > 0 && height > 0 && pixels.len() == width as usize * height as usize * 4)
+            .then(|| Self { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), width, height, pixels })
+    }
+
+    #[cfg(test)]
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        let i = (y * self.width + x) as usize * 4;
+        [self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3]]
+    }
+}
+
+/// Identity: two `Image`s are equal only if they are the same decoded image.
+impl PartialEq for Image {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::fmt::Debug for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Image #{} ({}x{})", self.id, self.width, self.height)
+    }
+}
+
+/// Direct2D bitmaps for `Image`s, keyed by image id. Device-dependent: cleared whenever the
+/// render target is rebuilt.
+#[derive(Default)]
+pub struct ImageCache(RefCell<HashMap<u64, ID2D1Bitmap>>);
+
+impl ImageCache {
+    /// Generous for a dozen app icons, a screenful of clipboard thumbnails and album art;
+    /// past it everything is dropped and re-uploaded as needed.
+    const CAPACITY: usize = 128;
+
+    pub fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+}
 
 /// Logical-unit rectangle.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -98,6 +155,8 @@ pub struct Brushes {
     accent: ID2D1SolidColorBrush,
     calm: ID2D1SolidColorBrush,
     glass: Glass,
+    /// Last value given to `set_content_opacity`, applied to images too.
+    content_opacity: Cell<f32>,
 }
 
 impl Brushes {
@@ -111,6 +170,7 @@ impl Brushes {
             accent: solid(rgba(122, 176, 255, 1.0))?,
             calm: solid(rgba(102, 214, 184, 1.0))?,
             glass: unsafe { Glass::new(rt)? },
+            content_opacity: Cell::new(1.0),
         })
     }
 
@@ -127,6 +187,7 @@ impl Brushes {
 
     /// Opacity of every content ink (not the body), used to fade content in and out.
     pub fn set_content_opacity(&self, a: f32) {
+        self.content_opacity.set(a);
         unsafe {
             for b in [&self.text, &self.dim, &self.track, &self.hover, &self.accent, &self.calm] {
                 b.SetOpacity(a);
@@ -151,6 +212,12 @@ pub enum Font {
     IconLarge,
     /// 32px light, for big numbers.
     Display,
+    /// 13px regular.
+    Body,
+    /// 18px semibold.
+    Heading,
+    /// 48px light, for the biggest numbers.
+    Hero,
 }
 
 /// Glyphs from Segoe Fluent Icons (Windows 11) / Segoe MDL2 Assets (Windows 10); the
@@ -164,6 +231,11 @@ pub mod glyph {
     pub const PIN: &str = "\u{E718}";
     pub const PINNED: &str = "\u{E842}";
     pub const RESET: &str = "\u{E72C}";
+    pub const APPS: &str = "\u{E71D}";
+    pub const CLIPBOARD: &str = "\u{E77F}";
+    pub const DOCUMENT: &str = "\u{E8A5}";
+    pub const LINK: &str = "\u{E71B}";
+    pub const DELETE: &str = "\u{E74D}";
 }
 
 /// Single-line text formats (no wrapping, ellipsis on overflow), sized for one DPI scale.
@@ -175,6 +247,9 @@ pub struct Fonts {
     icon_medium: IDWriteTextFormat,
     icon_large: IDWriteTextFormat,
     display: IDWriteTextFormat,
+    body: IDWriteTextFormat,
+    heading: IDWriteTextFormat,
+    hero: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -211,6 +286,9 @@ impl Fonts {
                 icon_medium: make(icons, 20.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 icon_large: make(icons, 24.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 display: make(ui, 32.0, DWRITE_FONT_WEIGHT_LIGHT)?,
+                body: make(ui, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                heading: make(ui, 18.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                hero: make(ui, 48.0, DWRITE_FONT_WEIGHT_LIGHT)?,
             })
         }
     }
@@ -224,6 +302,9 @@ impl Fonts {
             Font::IconMedium => &self.icon_medium,
             Font::IconLarge => &self.icon_large,
             Font::Display => &self.display,
+            Font::Body => &self.body,
+            Font::Heading => &self.heading,
+            Font::Hero => &self.hero,
         }
     }
 }
@@ -259,6 +340,7 @@ pub struct Canvas<'a> {
     rt: &'a ID2D1DCRenderTarget,
     brushes: &'a Brushes,
     fonts: &'a Fonts,
+    images: &'a ImageCache,
     scale: f32,
     /// Physical position of logical (0, 0).
     ox: f32,
@@ -272,11 +354,12 @@ impl<'a> Canvas<'a> {
         rt: &'a ID2D1DCRenderTarget,
         brushes: &'a Brushes,
         fonts: &'a Fonts,
+        images: &'a ImageCache,
         scale: f32,
         origin: (f32, f32),
         cursor: Option<(f32, f32)>,
     ) -> Self {
-        Self { rt, brushes, fonts, scale, ox: origin.0, oy: origin.1, cursor }
+        Self { rt, brushes, fonts, images, scale, ox: origin.0, oy: origin.1, cursor }
     }
 
     pub fn offset(&self, dx: f32, dy: f32) -> Self {
@@ -445,6 +528,55 @@ impl<'a> Canvas<'a> {
             };
             let style = factory.CreateStrokeStyle(&round, None).ok();
             self.rt.DrawGeometry(&path, brush, width * s, style.as_ref());
+        }
+    }
+
+    /// Draws `image` to fill `r` (cropping to keep its aspect ratio), with rounded corners.
+    pub fn image(&self, image: &Image, r: Rect, radius: f32) {
+        let mut cache = self.images.0.borrow_mut();
+        if !cache.contains_key(&image.id) {
+            if cache.len() >= ImageCache::CAPACITY {
+                cache.clear();
+            }
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let size = D2D_SIZE_U { width: image.width, height: image.height };
+            let pixels = Some(image.pixels.as_ptr().cast());
+            match unsafe { self.rt.CreateBitmap(size, pixels, image.width * 4, &props) } {
+                Ok(bitmap) => cache.insert(image.id, bitmap),
+                Err(_) => return,
+            };
+        }
+        let Some(bitmap) = cache.get(&image.id) else { return };
+        let dest = self.px(r);
+        let (dw, dh) = (dest.right - dest.left, dest.bottom - dest.top);
+        // "Cover" fit: scale to fill, centred.
+        let k = (dw / image.width as f32).max(dh / image.height as f32);
+        let transform = Matrix3x2 {
+            M11: k,
+            M12: 0.0,
+            M21: 0.0,
+            M22: k,
+            M31: dest.left + (dw - image.width as f32 * k) / 2.0,
+            M32: dest.top + (dh - image.height as f32 * k) / 2.0,
+        };
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES {
+            extendModeX: D2D1_EXTEND_MODE_CLAMP,
+            extendModeY: D2D1_EXTEND_MODE_CLAMP,
+            interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+        };
+        unsafe {
+            let Ok(brush) = self.rt.CreateBitmapBrush(bitmap, Some(&props), None) else { return };
+            brush.SetTransform(&transform);
+            brush.SetOpacity(self.brushes.content_opacity.get());
+            let rr = D2D1_ROUNDED_RECT { rect: dest, radiusX: radius * self.scale, radiusY: radius * self.scale };
+            self.rt.FillRoundedRectangle(&rr, &brush);
         }
     }
 

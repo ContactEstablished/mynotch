@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::{Compact, Widget};
@@ -5,20 +6,28 @@ use crate::gfx::{Align, Canvas, Font, Ink, Rect};
 use crate::stats::{Snapshot, Stats};
 
 const INTERVAL: Duration = Duration::from_secs(1);
-const ROW_H: f32 = 18.0;
+/// Seconds of history drawn in the graphs.
+const HISTORY: usize = 60;
+/// Network graphs scale to their recent peak, but never below this (bytes/s), so an idle
+/// connection reads as flat rather than as noise blown up to full height.
+const NET_FLOOR: f64 = 64.0 * 1024.0;
 
-/// Live CPU, RAM and network load.
+/// Live CPU, RAM and network load, with a minute of history.
 pub struct SystemWidget {
     stats: Stats,
-    /// `None` until the first sample; sysinfo needs two CPU refreshes a while apart
-    /// before usage is meaningful.
-    snap: Option<Snapshot>,
+    /// Newest last; empty until the first sample, since sysinfo needs two CPU refreshes a
+    /// while apart before usage is meaningful.
+    history: VecDeque<Snapshot>,
     next_sample: Instant,
 }
 
 impl SystemWidget {
     pub fn new() -> Self {
-        Self { stats: Stats::new(), snap: None, next_sample: Instant::now() + INTERVAL }
+        Self { stats: Stats::new(), history: VecDeque::with_capacity(HISTORY), next_sample: Instant::now() + INTERVAL }
+    }
+
+    fn latest(&self) -> Option<Snapshot> {
+        self.history.back().copied()
     }
 }
 
@@ -41,6 +50,20 @@ fn rate(bytes_per_sec: f64) -> String {
     }
 }
 
+/// Bar graph of `values` (each 0..=1), newest at the right, over a faint track.
+fn graph(cv: &Canvas, r: Rect, values: impl ExactSizeIterator<Item = f32>, ink: Ink) {
+    cv.fill(r, 6.0, Ink::Track);
+    let slot = r.w / HISTORY as f32;
+    let first = HISTORY - values.len().min(HISTORY);
+    for (i, v) in values.enumerate() {
+        let bh = (r.h - 4.0) * v.clamp(0.0, 1.0);
+        if bh >= 0.5 {
+            let x = r.x + (first + i) as f32 * slot;
+            cv.fill(Rect::new(x + 0.5, r.y + r.h - 2.0 - bh, (slot - 1.0).max(1.0), bh), 0.0, ink);
+        }
+    }
+}
+
 impl Widget for SystemWidget {
     fn title(&self) -> &'static str {
         "System"
@@ -51,40 +74,68 @@ impl Widget for SystemWidget {
             return false;
         }
         self.next_sample = now + INTERVAL;
-        let s = Some(self.stats.sample());
-        let changed = s != self.snap;
-        self.snap = s;
-        changed
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(self.stats.sample());
+        true
     }
 
     fn compact(&self) -> Option<Compact> {
-        let (cpu, ram) = (self.snap.map(|s| s.cpu), self.snap.map(|s| s.ram));
-        Some(Compact { priority: 1, text: format!("CPU {}  RAM {}", pct(cpu), pct(ram)), live: false })
+        let s = self.latest();
+        let text = format!("CPU {}  RAM {}", pct(s.map(|s| s.cpu)), pct(s.map(|s| s.ram)));
+        Some(Compact { priority: 1, text, live: false })
     }
 
-    fn draw(&self, cv: &Canvas, w: f32, _h: f32) {
-        let label = |text: &str, y: f32| cv.text(text, Font::Small, Ink::Dim, Rect::new(0.0, y, 44.0, ROW_H), Align::Left);
+    fn draw(&self, cv: &Canvas, w: f32, h: f32) {
+        let s = self.latest();
+        let row_h = h / 3.0;
+        let (gx, gw, vx) = (64.0, w - 64.0 - 196.0, w - 180.0);
+        let row = |i: usize| i as f32 * row_h;
+        let label = |text: &str, y: f32| cv.text(text, Font::Label, Ink::Dim, Rect::new(0.0, y, 56.0, row_h), Align::Left);
+        let graph_rect = |y: f32| Rect::new(gx, y + 8.0, gw, row_h - 16.0);
 
-        let bars = [("CPU", self.snap.map(|s| s.cpu)), ("RAM", self.snap.map(|s| s.ram))];
-        for (i, (name, value)) in bars.into_iter().enumerate() {
-            let y = 8.0 + i as f32 * 28.0;
-            label(name, y);
-            let track = Rect::new(50.0, y + 5.0, w - 110.0, 8.0);
-            cv.fill(track, 4.0, Ink::Track);
-            if let Some(v) = value {
-                cv.fill(Rect { w: (track.w * v / 100.0).max(1.0), ..track }, 4.0, Ink::Accent);
+        label("CPU", row(0));
+        graph(cv, graph_rect(row(0)), self.history.iter().map(|s| s.cpu / 100.0), Ink::Accent);
+        cv.text(&pct(s.map(|s| s.cpu)), Font::Heading, Ink::Text, Rect::new(vx, row(0), 180.0, row_h), Align::Right);
+
+        label("RAM", row(1));
+        graph(cv, graph_rect(row(1)), self.history.iter().map(|s| s.ram / 100.0), Ink::Accent);
+        cv.text(&pct(s.map(|s| s.ram)), Font::Heading, Ink::Text, Rect::new(vx, row(1), 180.0, row_h), Align::Right);
+
+        label("NET", row(2));
+        let peak = self.history.iter().map(|s| s.down).fold(NET_FLOOR, f64::max);
+        graph(cv, graph_rect(row(2)), self.history.iter().map(|s| (s.down / peak) as f32), Ink::Calm);
+        let (down, up) = s.map_or(("–".into(), "–".into()), |s| (rate(s.down), rate(s.up)));
+        let half = Rect::new(vx, row(2), 180.0, row_h / 2.0);
+        cv.text(&format!("↓  {down}"), Font::Body, Ink::Text, Rect { y: half.y + 6.0, ..half }, Align::Right);
+        cv.text(&format!("↑  {up}"), Font::Small, Ink::Dim, Rect { y: half.y + half.h - 2.0, ..half }, Align::Right);
+    }
+
+    fn card_weight(&self) -> Option<f32> {
+        Some(1.0)
+    }
+
+    fn draw_card(&self, cv: &Canvas, w: f32, h: f32) {
+        let s = self.latest();
+        let row_h = h / 3.0;
+        let rows: [(&str, String, Option<f32>); 3] = [
+            ("CPU", pct(s.map(|s| s.cpu)), s.map(|s| s.cpu / 100.0)),
+            ("RAM", pct(s.map(|s| s.ram)), s.map(|s| s.ram / 100.0)),
+            ("NET", s.map_or("–".into(), |s| format!("↓ {}", rate(s.down))), None),
+        ];
+        for (i, (name, value, fill)) in rows.into_iter().enumerate() {
+            let y = i as f32 * row_h;
+            cv.text(name, Font::Small, Ink::Dim, Rect::new(0.0, y, 40.0, 22.0), Align::Left);
+            cv.text(&value, Font::Title, Ink::Text, Rect::new(40.0, y, w - 40.0, 22.0), Align::Right);
+            let bar = Rect::new(0.0, y + 26.0, w, 4.0);
+            if let Some(f) = fill {
+                cv.fill(bar, 2.0, Ink::Track);
+                cv.fill(Rect { w: (bar.w * f).max(bar.h), ..bar }, 2.0, Ink::Accent);
+            } else if let Some(s) = s {
+                cv.text(&format!("↑ {}", rate(s.up)), Font::Small, Ink::Dim, Rect::new(0.0, y + 22.0, w, 16.0), Align::Right);
             }
-            cv.text(&pct(value), Font::Small, Ink::Text, Rect::new(w - 50.0, y, 50.0, ROW_H), Align::Right);
         }
-
-        let y = 64.0;
-        label("NET", y);
-        let (down, up) = match self.snap {
-            Some(s) => (rate(s.down), rate(s.up)),
-            None => ("–".into(), "–".into()),
-        };
-        cv.text(&format!("↓  {down}"), Font::Small, Ink::Text, Rect::new(50.0, y, 130.0, ROW_H), Align::Left);
-        cv.text(&format!("↑  {up}"), Font::Small, Ink::Text, Rect::new(180.0, y, 130.0, ROW_H), Align::Left);
     }
 }
 

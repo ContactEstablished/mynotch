@@ -13,11 +13,14 @@ pub struct Settings {
     pub tab: String,
     /// Length of a focus session (1..=180).
     pub focus_minutes: u32,
+    /// Apps pinned in the Apps tab, by shell id, in order. `None` until first chosen, so the
+    /// tab can suggest some on first run.
+    pub apps: Option<Vec<String>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { pinned: false, hide_in_fullscreen: true, tab: String::new(), focus_minutes: 25 }
+        Self { pinned: false, hide_in_fullscreen: true, tab: String::new(), focus_minutes: 25, apps: None }
     }
 }
 
@@ -58,6 +61,8 @@ impl Settings {
                         s.focus_minutes = m.clamp(1, 180);
                     }
                 }
+                // '|' can't appear in a path or an AppUserModelID.
+                "apps" => s.apps = Some(value.split('|').filter(|id| !id.is_empty()).map(String::from).collect()),
                 _ => {}
             }
         }
@@ -65,10 +70,14 @@ impl Settings {
     }
 
     fn serialize(&self) -> String {
-        format!(
+        let mut text = format!(
             "pinned={}\nhide_in_fullscreen={}\ntab={}\nfocus_minutes={}\n",
             self.pinned, self.hide_in_fullscreen, self.tab, self.focus_minutes
-        )
+        );
+        if let Some(apps) = &self.apps {
+            text += &format!("apps={}\n", apps.join("|"));
+        }
+        text
     }
 }
 
@@ -82,8 +91,13 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let s = Settings { pinned: true, hide_in_fullscreen: false, tab: "System".into(), focus_minutes: 50 };
+        let s = Settings { pinned: true, hide_in_fullscreen: false, tab: "System".into(), focus_minutes: 50, apps: None };
         assert_eq!(Settings::parse(&s.serialize()), s);
+        let apps = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Brave".to_string()];
+        let s = Settings { apps: Some(apps), ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s);
+        let s = Settings { apps: Some(Vec::new()), ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s, "all unpinned stays distinct from never set");
     }
 
     #[test]
