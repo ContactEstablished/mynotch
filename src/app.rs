@@ -530,10 +530,10 @@ fn ease(t: f32) -> f32 {
 
 fn with_app(f: impl FnOnce(&mut App)) {
     APP.with(|a| {
-        if let Ok(mut guard) = a.try_borrow_mut() {
-            if let Some(app) = guard.as_mut() {
-                f(app);
-            }
+        if let Ok(mut guard) = a.try_borrow_mut()
+            && let Some(app) = guard.as_mut()
+        {
+            f(app);
         }
     });
 }

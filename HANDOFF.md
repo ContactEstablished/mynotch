@@ -51,7 +51,6 @@ Verified on the dev machine (5120-wide primary monitor, 100% scale):
 - Opening the menu takes foreground from the active app (standard tray-menu behavior).
 - Generic `IDI_APPLICATION` tray icon; needs a real icon resource.
 - First CPU sample reads 0% (sysinfo needs two samples a refresh apart).
-- Clippy isn't installed: `rustup component add clippy`.
 - Network stats not yet implemented (CPU/RAM only).
-- No commits yet. The repo is initialized on `master` with `.gitignore` (`/target`).
+- Repo: `origin` = github.com/ContactEstablished/mynotch, default branch `main`.
 - Later milestones: media controls (Windows SMTC), focus timer + themes, tasks/notes, clipboard history, shortcuts, AI-app detection, GitHub activity, code playground. Add a widget trait/registry before the second widget.
