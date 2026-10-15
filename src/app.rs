@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use windows::{
     Win32::{
@@ -19,12 +20,11 @@ use windows::{
     },
     core::*,
 };
-use windows_numerics::Vector2;
 
-use crate::stats::{Snapshot, Stats};
+use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, Ink, Rect, glyph};
+use crate::widgets::{self, Compact, Widget};
 
 const TIMER_FRAME: usize = 1;
-const TIMER_STATS: usize = 2;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
@@ -37,6 +37,19 @@ const EXPANDED: (f32, f32) = (520.0, 150.0);
 const RADIUS: f32 = 20.0;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
 const HOVER_MARGIN: f32 = 6.0;
+
+// Expanded layout, in logical units relative to the expanded notch's top-left.
+const PAD: f32 = 24.0;
+const TAB_Y: f32 = 12.0;
+const TAB_W: f32 = 72.0;
+const TAB_H: f32 = 24.0;
+const TAB_GAP: f32 = 4.0;
+const PIN: Rect = Rect::new(EXPANDED.0 - PAD - TAB_H, TAB_Y, TAB_H, TAB_H);
+const CONTENT: Rect = Rect::new(PAD, 44.0, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - 44.0 - 12.0);
+
+fn tab_rect(i: usize) -> Rect {
+    Rect::new(PAD + i as f32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
+}
 
 /// Broadcast by Explorer when the taskbar is (re)created; the tray icon must be re-added.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -102,8 +115,7 @@ struct Layout {
     w: i32,
     h: i32,
     surface: Surface,
-    fmt_small: IDWriteTextFormat,
-    fmt_big: IDWriteTextFormat,
+    fonts: Fonts,
 }
 
 impl Layout {
@@ -121,18 +133,6 @@ impl Layout {
             let h = (EXPANDED.1 * scale).ceil() as i32 + 1;
             let m = info.rcMonitor;
 
-            let make_fmt = |size: f32, weight: DWRITE_FONT_WEIGHT| {
-                dwrite.CreateTextFormat(
-                    w!("Segoe UI"),
-                    None,
-                    weight,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    size * scale,
-                    w!("en-us"),
-                )
-            };
-
             Ok(Self {
                 scale,
                 x: m.left + (m.right - m.left - w) / 2,
@@ -140,34 +140,15 @@ impl Layout {
                 w,
                 h,
                 surface: Surface::new(w, h)?,
-                fmt_small: make_fmt(12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
-                fmt_big: make_fmt(22.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                fonts: Fonts::new(dwrite, scale)?,
             })
         }
     }
-}
 
-/// Device-dependent brushes; rebuilt together with the render target.
-struct Brushes {
-    black: ID2D1SolidColorBrush,
-    white: ID2D1SolidColorBrush,
-    dim: ID2D1SolidColorBrush,
-    track: ID2D1SolidColorBrush,
-    accent: ID2D1SolidColorBrush,
-}
-
-impl Brushes {
-    unsafe fn new(rt: &ID2D1DCRenderTarget) -> Result<Self> {
-        let solid = |r: f32, g: f32, b: f32| unsafe {
-            rt.CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a: 1.0 }, None)
-        };
-        Ok(Self {
-            black: solid(0.0, 0.0, 0.0)?,
-            white: solid(0.95, 0.95, 0.95)?,
-            dim: solid(0.6, 0.6, 0.65)?,
-            track: solid(0.2, 0.2, 0.24)?,
-            accent: solid(0.35, 0.65, 1.0)?,
-        })
+    /// Window-relative physical x of the expanded layout's origin. The fixed-size expanded
+    /// layout stays centred (and clipped to the body) while the notch animates.
+    fn origin_x(&self) -> f32 {
+        (self.w as f32 - EXPANDED.0 * self.scale) / 2.0
     }
 }
 
@@ -198,10 +179,14 @@ struct App {
     rt: ID2D1DCRenderTarget,
     brushes: Brushes,
     layout: Layout,
-    stats: Stats,
-    snap: Snapshot,
+    widgets: Vec<Box<dyn Widget>>,
+    /// Index of the widget shown when expanded.
+    active: usize,
+    /// Cursor in expanded-layout logical coordinates while it is over the notch.
+    cursor: Option<(f32, f32)>,
     /// 0.0 = collapsed, 1.0 = expanded.
     t: f32,
+    target: f32,
     pinned: bool,
     /// Keeps the notch open while its own context menu is showing.
     menu_open: bool,
@@ -245,13 +230,11 @@ pub fn run() -> Result<()> {
         )?;
 
         let mut app = App::new(hwnd)?;
-        app.sample_stats();
         app.render();
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         tray_add(hwnd);
         SetTimer(Some(hwnd), TIMER_FRAME, 16, None);
-        SetTimer(Some(hwnd), TIMER_STATS, 1000, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut msg = MSG::default();
@@ -281,21 +264,15 @@ impl App {
                 rt,
                 brushes,
                 layout,
-                stats: Stats::new(),
-                snap: Snapshot::default(),
+                widgets: widgets::all(),
+                active: 0,
+                cursor: None,
                 t: 0.0,
+                target: 0.0,
                 pinned: false,
                 menu_open: false,
                 dirty: true,
             })
-        }
-    }
-
-    fn sample_stats(&mut self) {
-        let s = self.stats.sample();
-        if s != self.snap {
-            self.snap = s;
-            self.dirty = true;
         }
     }
 
@@ -312,6 +289,15 @@ impl App {
         self.dirty = true;
     }
 
+    /// The collapsed readout, and the index of the widget providing it.
+    fn compact(&self) -> Option<(usize, Compact)> {
+        self.widgets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| w.compact().map(|c| (i, c)))
+            .max_by_key(|(_, c)| c.priority)
+    }
+
     /// Current notch size in physical pixels.
     fn notch_size(&self) -> (f32, f32) {
         let e = ease(self.t);
@@ -320,15 +306,23 @@ impl App {
         (w, h)
     }
 
-    /// Per-frame: hover detection and animation.
+    /// Per-frame: widget updates, hover detection and animation.
     fn tick(&mut self) {
+        let now = Instant::now();
+        for w in &mut self.widgets {
+            if w.update(now) {
+                self.dirty = true;
+            }
+        }
+
         let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
         }
         let l = &self.layout;
+        let s = l.scale;
         let (nw, nh) = self.notch_size();
-        let m = HOVER_MARGIN * l.scale;
+        let m = HOVER_MARGIN * s;
         let left = l.x as f32 + (l.w as f32 - nw) / 2.0 - m;
         let (px, py) = (pt.x as f32, pt.y as f32);
         let hovered = px >= left
@@ -336,7 +330,23 @@ impl App {
             && py >= l.y as f32
             && py < l.y as f32 + nh + m;
 
+        let cursor = hovered.then(|| ((px - l.x as f32 - l.origin_x()) / s, (py - l.y as f32) / s));
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            if self.t > 0.5 {
+                self.dirty = true;
+            }
+        }
+
         let target = if hovered || self.pinned || self.menu_open { 1.0 } else { 0.0 };
+        if target > self.target && self.t < 0.5 {
+            // Opening from collapsed: show the widget whose readout was on display.
+            if let Some((i, _)) = self.compact() {
+                self.active = i;
+            }
+        }
+        self.target = target;
+
         if (self.t - target).abs() > 0.001 {
             self.t += (target - self.t) * 0.22;
             if (self.t - target).abs() < 0.005 {
@@ -349,29 +359,32 @@ impl App {
         }
     }
 
-    fn pin_rect(&self) -> (f32, f32, f32) {
-        // Centre x, centre y, radius of the pin button (physical px, window-relative).
-        let s = self.layout.scale;
-        let (nw, _) = self.notch_size();
-        let right = (self.layout.w as f32 + nw) / 2.0;
-        (right - 26.0 * s, 24.0 * s, 6.0 * s)
-    }
-
+    /// A left click at window-relative physical coordinates.
     fn on_click(&mut self, x: i32, y: i32) {
         if self.t < 0.9 {
             return;
         }
-        let (cx, cy, r) = self.pin_rect();
-        let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-        if dx * dx + dy * dy <= (r * 2.0) * (r * 2.0) {
+        let s = self.layout.scale;
+        let (lx, ly) = ((x as f32 - self.layout.origin_x()) / s, y as f32 / s);
+
+        if PIN.contains(lx, ly) {
             self.toggle_pin();
+        } else if let Some(i) = (0..self.widgets.len()).find(|&i| tab_rect(i).contains(lx, ly)) {
+            if i != self.active {
+                self.active = i;
+                self.dirty = true;
+            }
+        } else if CONTENT.contains(lx, ly) {
+            let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
+            if self.widgets[self.active].click(cx, cy, CONTENT.w, CONTENT.h) {
+                self.dirty = true;
+            }
         }
     }
 
     fn render(&mut self) {
         self.dirty = false;
         let l = &self.layout;
-        let b = &self.brushes;
         let s = l.scale;
         let (nw, nh) = self.notch_size();
         let left = (l.w as f32 - nw) / 2.0;
@@ -386,63 +399,48 @@ impl App {
             self.rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
 
             // Body: extend above the window so the top corners stay flat.
-            let r = RADIUS * s;
-            let body = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left, top: -r, right: left + nw, bottom: nh },
-                radiusX: r,
-                radiusY: r,
-            };
-            self.rt.FillRoundedRectangle(&body, &b.black);
+            let canvas = |origin: f32, cursor| Canvas::new(&self.rt, &self.brushes, &l.fonts, s, (origin, 0.0), cursor);
+            let body = canvas(left, None);
+            body.fill(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, Ink::Body);
 
-            // Collapsed content: tiny live readout.
-            if e < 0.5 {
-                b.dim.SetOpacity(1.0 - e * 2.0);
-                let text = format!("CPU {:.0}%  RAM {:.0}%", self.snap.cpu, self.snap.ram);
-                self.text(&text, &l.fmt_small, left, 0.0, nw, nh, &b.dim, true);
+            // Collapsed content: the top-priority widget's one-line readout.
+            if e < 0.5
+                && let Some((_, compact)) = self.compact()
+            {
+                self.brushes.set_content_opacity(1.0 - e * 2.0);
+                let r = Rect::new(14.0, 0.0, nw / s - 28.0, nh / s);
+                body.text(&compact.text, Font::Small, Ink::Dim, r, Align::Center);
             }
 
-            // Expanded content.
+            // Expanded content: fixed layout, centred and clipped to the animating body.
             if e > 0.5 {
-                let a = (e - 0.5) * 2.0;
-                for brush in [&b.white, &b.dim, &b.track, &b.accent] {
-                    brush.SetOpacity(a);
-                }
+                self.brushes.set_content_opacity((e - 0.5) * 2.0);
+                let ox = l.origin_x();
+                let cv = canvas(ox, self.cursor);
+                cv.push_clip(Rect::new((left - ox) / s, 0.0, nw / s, nh / s));
 
-                let pad = 28.0 * s;
-                let x0 = left + pad;
-                let bar_w = nw - pad * 2.0;
-                self.text("System", &l.fmt_big, x0, 22.0 * s, 200.0 * s, 30.0 * s, &b.white, false);
-
-                let rows = [("CPU", self.snap.cpu), ("RAM", self.snap.ram)];
-                for (i, (label, pct)) in rows.iter().enumerate() {
-                    let y = (66.0 + i as f32 * 36.0) * s;
-                    self.text(label, &l.fmt_small, x0, y, 50.0 * s, 18.0 * s, &b.dim, false);
-                    let bx = x0 + 50.0 * s;
-                    let bw = bar_w - 100.0 * s;
-                    let bar = |w: f32| D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: bx,
-                            top: y + 5.0 * s,
-                            right: bx + w,
-                            bottom: y + 13.0 * s,
-                        },
-                        radiusX: 4.0 * s,
-                        radiusY: 4.0 * s,
+                for (i, w) in self.widgets.iter().enumerate() {
+                    let r = tab_rect(i);
+                    let ink = if i == self.active {
+                        cv.fill(r, TAB_H / 2.0, Ink::Track);
+                        Ink::Text
+                    } else if cv.hovered(r) {
+                        Ink::Text
+                    } else {
+                        Ink::Dim
                     };
-                    self.rt.FillRoundedRectangle(&bar(bw), &b.track);
-                    self.rt.FillRoundedRectangle(&bar((bw * pct / 100.0).max(1.0)), &b.accent);
-                    let v = format!("{pct:.0}%");
-                    self.text(&v, &l.fmt_small, bx + bw + 10.0 * s, y, 40.0 * s, 18.0 * s, &b.white, false);
+                    cv.text(w.title(), Font::Label, ink, r, Align::Center);
                 }
 
-                // Pin button.
-                let (cx, cy, pr) = self.pin_rect();
-                let c = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: pr, radiusY: pr };
-                if self.pinned {
-                    self.rt.FillEllipse(&c, &b.accent);
-                } else {
-                    self.rt.DrawEllipse(&c, &b.dim, 1.5 * s, None);
-                }
+                let (pin, ink) = match (self.pinned, cv.hovered(PIN)) {
+                    (true, _) => (glyph::PINNED, Ink::Accent),
+                    (false, true) => (glyph::PIN, Ink::Text),
+                    (false, false) => (glyph::PIN, Ink::Dim),
+                };
+                cv.text(pin, Font::Icon, ink, PIN, Align::Center);
+
+                self.widgets[self.active].draw(&cv.offset(CONTENT.x, CONTENT.y), CONTENT.w, CONTENT.h);
+                cv.pop_clip();
             }
 
             match self.rt.EndDraw(None, None) {
@@ -478,42 +476,6 @@ impl App {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn text(
-        &self,
-        s: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        brush: &ID2D1SolidColorBrush,
-        center: bool,
-    ) {
-        unsafe {
-            let wide: Vec<u16> = s.encode_utf16().collect();
-            let _ = fmt.SetTextAlignment(if center {
-                DWRITE_TEXT_ALIGNMENT_CENTER
-            } else {
-                DWRITE_TEXT_ALIGNMENT_LEADING
-            });
-            let _ = fmt.SetParagraphAlignment(if center {
-                DWRITE_PARAGRAPH_ALIGNMENT_CENTER
-            } else {
-                DWRITE_PARAGRAPH_ALIGNMENT_NEAR
-            });
-            let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
-            self.rt.DrawText(
-                &wide,
-                fmt,
-                &rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
             );
         }
     }
@@ -613,10 +575,8 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
-            match wparam.0 {
-                TIMER_FRAME => with_app(|a| a.tick()),
-                TIMER_STATS => with_app(|a| a.sample_stats()),
-                _ => {}
+            if wparam.0 == TIMER_FRAME {
+                with_app(|a| a.tick());
             }
             LRESULT(0)
         }
