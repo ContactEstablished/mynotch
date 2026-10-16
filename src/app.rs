@@ -60,7 +60,7 @@ const CMD_AUTOSTART: usize = 3;
 const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
-const COLLAPSED: (f32, f32) = (220.0, 32.0);
+const COLLAPSED: (f32, f32) = (250.0, 32.0);
 const EXPANDED: (f32, f32) = (720.0, 210.0);
 const RADIUS: f32 = space::BODY_RADIUS;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
@@ -1610,8 +1610,8 @@ impl App {
         })
     }
 
-    /// The collapsed notch: the time on the left, the top-priority widget's readout (a
-    /// running timer, the song playing, CPU and RAM) on the right, and a hairline of
+    /// The collapsed notch: the time and temperature on the left, the top-priority widget's
+    /// readout (a running timer, the song playing, CPU and RAM) on the right, and a hairline of
     /// progress along the bottom while a timer runs or a song plays.
     fn draw_rail(&self, cv: &Canvas, w: f32, h: f32) {
         let baseline = h / 2.0 + 5.0;
@@ -1621,6 +1621,11 @@ impl App {
             let r = Rect::new(x + 3.0, baseline - 11.0, 24.0, 12.0);
             cv.caps(&marker, Font::Caption, Ink::Dim, r, Align::Left);
             x += 3.0 + cv.measure(&marker, Font::Caption) + 2.0;
+        }
+        // The temperature, once there's weather; a step quieter than the time.
+        if let Some(report) = self.weather.report() {
+            let degrees = format!("{:.0}°", report.temperature.round() + 0.0);
+            x += 8.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 8.0, baseline, Align::Left);
         }
         let Some((i, compact)) = self.compact() else { return };
         cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
