@@ -118,9 +118,7 @@ impl Widget for ClipboardWidget {
         let now = Instant::now();
         for (i, r) in self.rows(w, h) {
             let clip = &self.items[i];
-            if cv.hovered(r) {
-                cv.fill(r, 8.0, Ink::Track);
-            }
+            cv.fill_a(r, 8.0, Ink::Track, cv.hover(r));
             let lead = Rect::new(r.x + 6.0, r.y + 4.0, 40.0, r.h - 8.0);
             let text = Rect::new(r.x + 56.0, r.y, r.w - 56.0 - 64.0, r.h);
             let meta = Rect::new(r.right() - 60.0, r.y, 52.0, r.h);

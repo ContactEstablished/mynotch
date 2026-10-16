@@ -10,9 +10,12 @@ use windows::{
             },
             Threading::CreateMutexW,
         },
-        UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsZoomed},
+        UI::WindowsAndMessaging::{
+            GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsZoomed,
+            SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        },
     },
-    core::{PCWSTR, w},
+    core::{BOOL, PCWSTR, w},
 };
 
 /// Returns false if another MyNotch is already running in this session. The mutex is never
@@ -54,21 +57,42 @@ pub mod autostart {
     }
 }
 
-/// Whether the taskbar uses the light theme (Settings > Personalization > Colors).
-pub fn taskbar_is_light() -> bool {
+/// A DWORD from the user's personalization settings, if it's set.
+fn personalize(name: PCWSTR) -> Option<u32> {
     let (mut value, mut size) = (0u32, size_of::<u32>() as u32);
-    unsafe {
+    let found = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("SystemUsesLightTheme"),
+            name,
             RRF_RT_REG_DWORD,
             None,
             Some((&raw mut value).cast()),
             Some(&mut size),
         ) == ERROR_SUCCESS
-            && value != 0
+    };
+    found.then_some(value)
+}
+
+/// Whether the taskbar uses the light theme (Settings > Personalization > Colors).
+pub fn taskbar_is_light() -> bool {
+    personalize(w!("SystemUsesLightTheme")).is_some_and(|v| v != 0)
+}
+
+/// Whether the user allows transparency effects (Settings > Personalization > Colors). With
+/// them off, the glass is solid and nothing behind it is blurred.
+pub fn transparency_enabled() -> bool {
+    personalize(w!("EnableTransparency")) != Some(0)
+}
+
+/// Whether Windows' animation effects are on (Settings > Accessibility > Visual effects).
+pub fn animations_enabled() -> bool {
+    let mut on = BOOL(1);
+    unsafe {
+        let flags = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0);
+        let _ = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some((&raw mut on).cast()), flags);
     }
+    on.as_bool()
 }
 
 /// Whether the foreground window covers all of `monitor`: a fullscreen game, video or

@@ -59,7 +59,7 @@ fn graph(cv: &Canvas, r: Rect, values: impl ExactSizeIterator<Item = f32>, ink: 
         let bh = (r.h - 4.0) * v.clamp(0.0, 1.0);
         if bh >= 0.5 {
             let x = r.x + (first + i) as f32 * slot;
-            cv.fill(Rect::new(x + 0.5, r.y + r.h - 2.0 - bh, (slot - 1.0).max(1.0), bh), 0.0, ink);
+            cv.fill_a(Rect::new(x + 0.5, r.y + r.h - 2.0 - bh, (slot - 1.0).max(1.0), bh), 0.0, ink, 0.7);
         }
     }
 }
@@ -88,7 +88,7 @@ impl Widget for SystemWidget {
     fn compact(&self) -> Option<Compact> {
         let s = self.latest();
         let text = format!("CPU {}  RAM {}", pct(s.map(|s| s.cpu)), pct(s.map(|s| s.ram)));
-        Some(Compact { priority: 1, text, live: false })
+        Some(Compact { priority: 1, text, live: false, progress: None })
     }
 
     fn draw(&self, cv: &Canvas, w: f32, h: f32) {
@@ -96,7 +96,7 @@ impl Widget for SystemWidget {
         let row_h = h / 3.0;
         let (gx, gw, vx) = (64.0, w - 64.0 - 196.0, w - 180.0);
         let row = |i: usize| i as f32 * row_h;
-        let label = |text: &str, y: f32| cv.text(text, Font::Label, Ink::Dim, Rect::new(0.0, y, 56.0, row_h), Align::Left);
+        let label = |text: &str, y: f32| cv.caps(text, Font::Caption, Ink::Dim, Rect::new(0.0, y, 56.0, row_h), Align::Left);
         let graph_rect = |y: f32| Rect::new(gx, y + 8.0, gw, row_h - 16.0);
 
         label("CPU", row(0));
@@ -130,7 +130,7 @@ impl Widget for SystemWidget {
         ];
         for (i, (name, value, fill)) in rows.into_iter().enumerate() {
             let y = i as f32 * row_h;
-            cv.text(name, Font::Small, Ink::Dim, Rect::new(0.0, y, 40.0, 22.0), Align::Left);
+            cv.caps(name, Font::Caption, Ink::Dim, Rect::new(0.0, y, 40.0, 22.0), Align::Left);
             cv.text(&value, Font::Title, Ink::Text, Rect::new(40.0, y, w - 40.0, 22.0), Align::Right);
             let bar = Rect::new(0.0, y + 26.0, w, 4.0);
             if let Some(f) = fill {

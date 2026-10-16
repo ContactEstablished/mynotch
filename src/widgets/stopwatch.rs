@@ -1,15 +1,24 @@
 //! The Time tab's stopwatch card: start, pause, reset.
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use super::{Compact, button, button_row, clock};
+use super::{Compact, button, clock, pill, pulsing};
 use crate::gfx::{Align, Canvas, Font, Ink, Rect, glyph};
+use crate::motion::{self, reduced};
+use crate::theme::{motion as timing, space};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Control {
     Reset,
     Toggle,
 }
+
+/// Wide enough for "Resume".
+const PILL_W: f32 = 88.0;
+const CONTROL_H: f32 = 28.0;
+/// Where the time sits (its baseline).
+const BASELINE: f32 = 56.0;
 
 /// A stopwatch counting up in tenths of a second. Time is passed in, for testing.
 pub struct Stopwatch {
@@ -19,18 +28,22 @@ pub struct Stopwatch {
     since: Option<Instant>,
     /// Tenths last drawn, so a running stopwatch redraws ten times a second.
     shown: u128,
+    /// When it last started (or resumed), for its one soft pulse.
+    started: Option<Instant>,
+    /// Drawn last frame mid-pulse, so the frame that ends it gets drawn too.
+    was_pulsing: Cell<bool>,
 }
 
 impl Stopwatch {
     pub fn new() -> Self {
-        Self { banked: Duration::ZERO, since: None, shown: u128::MAX }
+        Self { banked: Duration::ZERO, since: None, shown: u128::MAX, started: None, was_pulsing: Cell::new(false) }
     }
 
     fn elapsed(&self, now: Instant) -> Duration {
         self.banked + self.since.map_or(Duration::ZERO, |s| now.saturating_duration_since(s))
     }
 
-    fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         self.since.is_some()
     }
 
@@ -48,12 +61,13 @@ impl Stopwatch {
         self.since = None;
     }
 
-    /// Returns true when the time shown changed.
+    /// Returns true when the time shown changed, and every frame of the start pulse.
     pub fn update(&mut self, now: Instant) -> bool {
         let tenths = self.elapsed(now).as_millis() / 100;
         let changed = tenths != self.shown;
         self.shown = tenths;
-        changed
+        let pulse = pulsing(self.started);
+        changed || pulse || self.was_pulsing.replace(pulse)
     }
 
     pub fn compact(&self) -> Option<Compact> {
@@ -61,9 +75,9 @@ impl Stopwatch {
         let time = clock(self.elapsed(now));
         // Below a running focus timer and a playing song; a paused one, just above CPU stats.
         if self.is_running() {
-            Some(Compact { priority: 8, text: format!("Stopwatch  {time}"), live: true })
+            Some(Compact { priority: 8, text: format!("Stopwatch  {time}"), live: true, progress: None })
         } else if self.elapsed(now) > Duration::ZERO {
-            Some(Compact { priority: 4, text: format!("Stopwatch  {time}"), live: false })
+            Some(Compact { priority: 4, text: format!("Stopwatch  {time}"), live: false, progress: None })
         } else {
             None
         }
@@ -71,25 +85,65 @@ impl Stopwatch {
 
     pub fn draw(&self, cv: &Canvas, w: f32, h: f32) {
         let now = Instant::now();
-        let label = if !self.is_running() && self.elapsed(now) > Duration::ZERO { "Stopwatch · paused" } else { "Stopwatch" };
-        cv.text(label, Font::Small, Ink::Dim, Rect::new(0.0, 0.0, w, 16.0), Align::Left);
-        cv.text(&format_elapsed(self.elapsed(now)), Font::Display, Ink::Text, Rect::new(0.0, 18.0, w, 42.0), Align::Left);
+        self.was_pulsing.set(pulsing(self.started));
+        let elapsed = self.elapsed(now);
+        super::time::header(cv, Some(glyph::STOPWATCH), "Stopwatch", Ink::Dim, w);
+        if !self.is_running() && elapsed > Duration::ZERO {
+            cv.caps("Paused", Font::Caption, Ink::Dim, Rect::new(0.0, -1.0, w, 16.0), Align::Right);
+        }
+        let (whole, tenths) = format_elapsed(elapsed);
+        let runs = [(whole.as_str(), Font::Stopwatch, Ink::Text), (tenths.as_str(), Font::Fraction, Ink::Dim)];
+        cv.numerals(&runs, 0.0, BASELINE, Align::Left);
+        // This minute, swept by a light like a second hand: moving while it runs, dimmed
+        // while paused.
+        let y = 70.0;
+        cv.line((0.0, y), (w, y), Ink::Line);
+        if elapsed > Duration::ZERO {
+            let x = (w * (elapsed.as_secs_f32() % 60.0) / 60.0).max(1.5);
+            let a = if self.is_running() { 1.0 } else { 0.45 };
+            cv.fill_a(Rect::new(0.0, y - 0.75, x, 1.5), 0.75, Ink::Accent, 0.8 * a);
+            if self.is_running() {
+                let swell = if reduced() { 0.6 } else { motion::breath(2.0) };
+                cv.halo(x, y, 2.0 + swell, Ink::Accent, 0.35 + 0.65 * swell);
+            }
+            cv.circle_a(x, y, 2.0, Ink::Accent, None, a);
+        }
         for (control, r) in controls(w, h) {
             match control {
-                Control::Reset => {
-                    button(cv, r, glyph::RESET, Font::Icon, self.elapsed(now) > Duration::ZERO, false);
-                }
+                Control::Reset => button(cv, r, glyph::RESET, Font::Icon, elapsed > Duration::ZERO, false),
                 Control::Toggle => {
-                    let icon = if self.is_running() { glyph::PAUSE } else { glyph::PLAY };
-                    button(cv, r, icon, Font::IconLarge, true, true);
+                    let (icon, label) = match (self.is_running(), elapsed > Duration::ZERO) {
+                        (true, _) => (glyph::PAUSE, "Pause"),
+                        (false, true) => (glyph::PLAY, "Resume"),
+                        (false, false) => (glyph::PLAY, "Start"),
+                    };
+                    let lit = cv.ease(motion::key("stopwatch"), f32::from(u8::from(self.is_running())), timing::STATE);
+                    self.draw_pulse(cv, r);
+                    pill(cv, r, icon, label, lit);
                 }
             }
         }
     }
 
+    /// One soft glow spreading out from the Start button as the stopwatch starts.
+    fn draw_pulse(&self, cv: &Canvas, r: Rect) {
+        let Some(since) = self.started.filter(|_| !reduced()) else { return };
+        let t = since.elapsed().as_secs_f32() / timing::PULSE.as_secs_f32();
+        if t < 1.0 {
+            let grow = 10.0 * (1.0 - (1.0 - t) * (1.0 - t));
+            cv.outline(r.inset(-grow), space::CONTROL_RADIUS + grow, Ink::Accent, 0.45 * (1.0 - t));
+        }
+    }
+
     pub fn click(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
         match controls(w, h).into_iter().find(|(_, r)| r.contains(x, y)) {
-            Some((Control::Toggle, _)) => self.toggle(Instant::now()),
+            Some((Control::Toggle, _)) => {
+                let now = Instant::now();
+                self.toggle(now);
+                if self.is_running() {
+                    self.started = Some(now);
+                }
+            }
             Some((Control::Reset, _)) if self.elapsed(Instant::now()) > Duration::ZERO => self.reset(),
             _ => return false,
         }
@@ -98,18 +152,21 @@ impl Stopwatch {
     }
 }
 
-/// Reset and start/pause, centred at the bottom.
-fn controls(w: f32, h: f32) -> [(Control, Rect); 2] {
-    let [reset, toggle] = button_row(w / 2.0, h - 26.0, [36.0, 48.0], 16.0);
+/// Start/pause as a labelled button, then reset, along the bottom.
+fn controls(_w: f32, h: f32) -> [(Control, Rect); 2] {
+    let y = h - CONTROL_H - 6.0;
+    let toggle = Rect::new(0.0, y, PILL_W, CONTROL_H);
+    let reset = Rect::new(toggle.right() + 6.0, y, CONTROL_H, CONTROL_H);
     [(Control::Reset, reset), (Control::Toggle, toggle)]
 }
 
-/// "0:07.3", "12:34.5", then "1:02:03" past an hour.
-fn format_elapsed(d: Duration) -> String {
-    if d.as_secs() >= 3600 {
-        clock(d)
+/// ("00:07", ".3"), ("12:34", ".5"), then ("1:02:03", "") past an hour.
+fn format_elapsed(d: Duration) -> (String, String) {
+    let s = d.as_secs();
+    if s >= 3600 {
+        (clock(d), String::new())
     } else {
-        format!("{}.{}", clock(d), d.subsec_millis() / 100)
+        (format!("{:02}:{:02}", s / 60, s % 60), format!(".{}", d.subsec_millis() / 100))
     }
 }
 
@@ -150,8 +207,9 @@ mod tests {
 
     #[test]
     fn format() {
-        assert_eq!(format_elapsed(Duration::from_millis(7_340)), "0:07.3");
-        assert_eq!(format_elapsed(Duration::from_millis(754_560)), "12:34.5");
-        assert_eq!(format_elapsed(Duration::from_secs(3723)), "1:02:03");
+        let parts = |d| { let (a, b) = format_elapsed(d); format!("{a}{b}") };
+        assert_eq!(parts(Duration::from_millis(7_340)), "00:07.3");
+        assert_eq!(parts(Duration::from_millis(754_560)), "12:34.5");
+        assert_eq!(parts(Duration::from_secs(3723)), "1:02:03");
     }
 }

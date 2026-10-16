@@ -7,26 +7,81 @@ mod clipboard;
 mod clock;
 mod focus;
 mod media;
+mod sky;
 mod stopwatch;
 mod system;
 mod time;
 
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::gfx::{Align, Canvas, Font, Ink, Rect};
+use crate::motion;
+use crate::theme::{motion as timing, space};
 use crate::settings::Settings;
+use crate::weather::Weather;
 
-/// A round icon button. `primary` gets a filled disc; others only light up on hover.
-/// Disabled buttons are drawn faint and never highlight.
+/// A round icon button. `primary` is lit cyan glass with a soft halo; others are bare icons
+/// that light up under the cursor. Disabled buttons are drawn faint and never highlight.
 fn button(cv: &Canvas, r: Rect, icon: &str, font: Font, enabled: bool, primary: bool) {
-    let hot = enabled && cv.hovered(r);
-    let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+    let hot = cv.hover_if(r, enabled);
+    let (cx, cy, radius) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0);
     if primary {
-        cv.circle(cx, cy, r.w / 2.0, if hot { Ink::Hover } else { Ink::Track }, None);
-    } else if hot {
-        cv.circle(cx, cy, r.w / 2.0, Ink::Track, None);
+        cv.circle(cx, cy, radius, Ink::Lit, None);
+        cv.circle_a(cx, cy, radius, Ink::Lit, None, hot);
+        cv.circle_a(cx, cy, radius - 0.5, Ink::LitEdge, Some(1.0), 0.8 + 0.2 * hot);
+        cv.halo(cx, cy, radius, Ink::Accent, 0.5 + 0.5 * hot);
+    } else {
+        cv.circle_a(cx, cy, radius, Ink::Hover, None, hot);
     }
-    cv.text(icon, font, if enabled { Ink::Text } else { Ink::Track }, r, Align::Center);
+    if enabled {
+        cv.text(icon, font, if primary { Ink::Text } else { Ink::Dim }, r, Align::Center);
+        cv.text_a(icon, font, Ink::Text, r, Align::Center, hot);
+    } else {
+        cv.text(icon, font, Ink::Track, r, Align::Center);
+    }
+}
+
+/// A rounded rectangular button with an icon and a label, e.g. the stopwatch's Start.
+/// `lit` (0..=1) edges it in cyan.
+fn pill(cv: &Canvas, r: Rect, icon: &str, label: &str, lit: f32) {
+    let hot = cv.hover(r);
+    cv.fill(r, space::CONTROL_RADIUS, Ink::Track);
+    cv.fill_a(r, space::CONTROL_RADIUS, Ink::Hover, hot);
+    cv.fill_a(r, space::CONTROL_RADIUS, Ink::Lit, lit);
+    cv.outline(r, space::CONTROL_RADIUS, Ink::Edge, 1.0 - lit);
+    cv.outline(r, space::CONTROL_RADIUS, Ink::LitEdge, lit);
+    let icon_r = Rect::new(r.x + 8.0, r.y, 18.0, r.h);
+    cv.text(icon, Font::Icon, Ink::Text, icon_r, Align::Center);
+    let text_r = Rect::new(icon_r.right() + 4.0, r.y, r.w - icon_r.right() + r.x - 10.0, r.h);
+    cv.text(label, Font::Label, Ink::Text, text_r, Align::Left);
+}
+
+/// One soft ring spreading out from a circle and fading, `since` a timer started. Nothing
+/// once it's over, or with animations turned off.
+fn pulse(cv: &Canvas, cx: f32, cy: f32, radius: f32, ink: Ink, since: Option<Instant>) {
+    let Some(since) = since.filter(|_| !motion::reduced()) else { return };
+    let t = since.elapsed().as_secs_f32() / timing::PULSE.as_secs_f32();
+    if t < 1.0 {
+        let out = 1.0 - (1.0 - t) * (1.0 - t);
+        cv.circle_a(cx, cy, radius + 14.0 * out, ink, Some(2.0 + 4.0 * (1.0 - t)), 0.45 * (1.0 - t));
+    }
+}
+
+/// Whether a pulse started at `since` is still under way, so its widget keeps redrawing.
+fn pulsing(since: Option<Instant>) -> bool {
+    since.is_some_and(|s| !motion::reduced() && s.elapsed() < timing::PULSE)
+}
+
+/// How long the light takes to run once round a running card.
+const LAP: f32 = 4.0;
+
+/// The cue that a card's timer is running: a light running round its edge. (With
+/// animations off, the card's own lit edge says it instead.)
+pub fn running_edge(cv: &Canvas, card: Rect, ink: Ink) {
+    if !motion::reduced() {
+        cv.runner(card, space::CARD_RADIUS, motion::cycle(LAP), ink, 1.0);
+    }
 }
 
 /// Square buttons of the given sizes in a row centred on `cx`, vertically centred on `cy`.
@@ -46,10 +101,15 @@ const KNOB_R: f32 = 8.0;
 /// Disabled sliders are drawn grey.
 pub fn slider(cv: &Canvas, track: Rect, k: f32, hot: bool, enabled: bool) {
     let x = track.x + track.w * k.clamp(0.0, 1.0);
+    let cy = track.y + track.h / 2.0;
     cv.fill(track, track.h / 2.0, Ink::Track);
     cv.fill(Rect { w: x - track.x, ..track }, track.h / 2.0, if enabled { Ink::Accent } else { Ink::Dim });
-    let r = if hot && enabled { KNOB_R + 1.0 } else { KNOB_R };
-    cv.circle(x, track.y + track.h / 2.0, r, if enabled { Ink::Text } else { Ink::Dim }, None);
+    let grow = cv.ease(motion::key(("knob", track.x as i32, track.y as i32)), f32::from(u8::from(hot && enabled)), timing::HOVER);
+    let r = KNOB_R * 0.75 + grow;
+    if enabled {
+        cv.halo(x, cy, r, Ink::Accent, 0.4 + 0.6 * grow);
+    }
+    cv.circle(x, cy, r, if enabled { Ink::Text } else { Ink::Dim }, None);
 }
 
 /// The fraction of `track`'s length at x, for a slider.
@@ -75,6 +135,8 @@ pub struct Compact {
     /// Live activity (e.g. a song playing): opening the notch then shows this widget instead
     /// of the last tab the user picked.
     pub live: bool,
+    /// How far through it is (a running timer), shown as a hairline along the rail.
+    pub progress: Option<f32>,
 }
 
 /// Keys the shell forwards to the widget showing search results.
@@ -161,6 +223,22 @@ pub trait Widget {
         None
     }
 
+    /// Whether something this widget shows is moving on its own (a running timer), so the
+    /// shell keeps drawing frames while it's on screen.
+    fn animating(&self) -> bool {
+        false
+    }
+
+    /// `animating`, for the Home card.
+    fn card_animating(&self) -> bool {
+        false
+    }
+
+    /// Whether the Home card is edged in light, as the one that matters most.
+    fn card_lit(&self) -> bool {
+        false
+    }
+
     /// Draws the Home card's content area, of logical size `w` x `h`, at the canvas origin.
     fn draw_card(&self, _cv: &Canvas, _w: f32, _h: f32) {}
 
@@ -198,11 +276,13 @@ pub trait Widget {
     }
 }
 
-/// Every widget, in tab order.
-pub fn all() -> Vec<Box<dyn Widget>> {
+pub use clock::now_short;
+
+/// Every widget, in tab order. The Time tab shows `weather`.
+pub fn all(weather: &Rc<Weather>) -> Vec<Box<dyn Widget>> {
     vec![
         Box::new(media::MediaWidget::new()),
-        Box::new(time::TimeWidget::new()),
+        Box::new(time::TimeWidget::new(weather.clone())),
         Box::new(apps::AppsWidget::new()),
         Box::new(clipboard::ClipboardWidget::new()),
         Box::new(system::SystemWidget::new()),

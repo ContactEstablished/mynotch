@@ -9,7 +9,7 @@ use crate::gfx::{Align, Canvas, Font, Ink, Rect, Rgb};
 /// Room so the caret isn't clipped at the field's right edge.
 const CARET_ROOM: f32 = 2.0;
 /// Behind selected text.
-const SELECTION: Rgb = Rgb(52, 84, 140);
+const SELECTION: Rgb = crate::theme::color::SELECTION;
 /// Space above and below the caret and the selection, inside the field.
 const INSET: f32 = 7.0;
 

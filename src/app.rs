@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -30,14 +31,18 @@ use windows::{
     core::*,
 };
 
+use crate::backdrop::{self, Backdrop};
 use crate::clipboard;
 use crate::desktop::{self, autostart};
-use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Look, Rect, glyph};
+use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Look, Numerals, Rect, glyph};
 use crate::hotkey::{self, Hotkey};
 use crate::icon;
+use crate::motion::{self, Motion};
 use crate::settings::Settings;
-use crate::settings_panel::{self, Hit, ShortcutRow};
+use crate::settings_panel::{self, Hit, PlaceRow, ShortcutRow};
 use crate::text::{self, Command, TextField, Utf16Joiner};
+use crate::theme::{motion as timing, space};
+use crate::weather::Weather;
 use crate::widgets::{self, Compact, SearchAction, SearchKey, Widget};
 
 const TIMER_FRAME: usize = 1;
@@ -55,30 +60,43 @@ const CMD_AUTOSTART: usize = 3;
 const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
-const COLLAPSED: (f32, f32) = (190.0, 32.0);
-const EXPANDED: (f32, f32) = (720.0, 240.0);
-const RADIUS: f32 = 24.0;
+const COLLAPSED: (f32, f32) = (220.0, 32.0);
+const EXPANDED: (f32, f32) = (720.0, 210.0);
+const RADIUS: f32 = space::BODY_RADIUS;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
 const HOVER_MARGIN: f32 = 6.0;
 /// Room around the expanded notch for its drop shadow.
-const SHADOW: f32 = 18.0;
+const SHADOW: f32 = 22.0;
+/// How far the blur behind the glass stays inside the body's edge, so its own (smaller)
+/// rounded corners never show past the glass's.
+const BLUR_INSET: f32 = 3.0;
+/// Each frame of the open/close animation goes this fraction of the way.
+const ANIMATION_STEP: f32 = 0.22;
 
 // Expanded layout, in logical units relative to the expanded notch's top-left.
-const PAD: f32 = 24.0;
-const TAB_Y: f32 = 8.0;
-const TAB_W: f32 = 44.0;
-const TAB_H: f32 = 32.0;
-const TAB_GAP: f32 = 4.0;
-const TAB_RADIUS: f32 = 8.0;
-/// Where the line the tabs stand on is.
-const TAB_BASE: f32 = TAB_Y + TAB_H;
-const PIN_SIZE: f32 = 24.0;
-const PIN: Rect = Rect::new(EXPANDED.0 - PAD - PIN_SIZE, TAB_Y + (TAB_H - PIN_SIZE) / 2.0, PIN_SIZE, PIN_SIZE);
-const CONTENT: Rect = Rect::new(PAD, 48.0, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - 48.0 - 16.0);
+const PAD: f32 = space::PAD;
+/// The toolbar: tabs and buttons in a row, over a hairline.
+const BAR: f32 = space::TOOLBAR;
+const TAB_Y: f32 = 7.0;
+const TAB_W: f32 = 32.0;
+const TAB_H: f32 = 30.0;
+const TAB_GAP: f32 = 2.0;
+const TAB_RADIUS: f32 = 9.0;
+/// The brand mark at the toolbar's left, and the tabs after its divider.
+const LOGO: Rect = Rect::new(PAD, TAB_Y, 30.0, TAB_H);
+const DIVIDER_X: f32 = 52.0;
+const TABS_X: f32 = 60.0;
+/// The open tab widens to show its name: by the name's width plus this.
+const NAME_PAD: f32 = 10.0;
+/// The most an open tab's name may take; the stretch starts after the widest.
+const NAME_ROOM: f32 = 66.0;
+const PIN: Rect = Rect::new(EXPANDED.0 - PAD - TAB_W, TAB_Y, TAB_W, TAB_H);
+const CONTENT_Y: f32 = BAR + space::GAP;
+const CONTENT: Rect = Rect::new(PAD, CONTENT_Y, EXPANDED.0 - PAD * 2.0, EXPANDED.1 - CONTENT_Y - 12.0);
 // Home dashboard cards.
-const CARD_GAP: f32 = 12.0;
-const CARD_PAD: f32 = 14.0;
-const CARD_RADIUS: f32 = 16.0;
+const CARD_GAP: f32 = space::GAP;
+const CARD_PAD: f32 = space::CARD_PAD;
+const CARD_RADIUS: f32 = space::CARD_RADIUS;
 /// A slide that ends this close to the middle of the screen snaps to it.
 const SNAP: f32 = 12.0;
 /// Longest search query, in chars.
@@ -94,16 +112,20 @@ fn settings_tab(widgets: &[Box<dyn Widget>]) -> usize {
     widgets.len() + 1
 }
 
-fn tab_count(widgets: &[Box<dyn Widget>]) -> usize {
-    widgets.len() + 2
-}
-
-fn tab_rect(widgets: &[Box<dyn Widget>], tab: usize) -> Rect {
-    if tab == settings_tab(widgets) {
-        Rect::new(PIN.x - 8.0 - TAB_W, TAB_Y, TAB_W, TAB_H)
-    } else {
-        Rect::new(PAD + tab as f32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
-    }
+/// Every tab's rect: Home and the widgets from the left, then Settings by the pin. The open
+/// tab (`open`, if any) is widened by `name_w` to show its name; Settings never is.
+fn tab_rects(widgets: &[Box<dyn Widget>], open: Option<usize>, name_w: f32) -> Vec<Rect> {
+    let mut x = TABS_X;
+    let mut rects: Vec<Rect> = (0..settings_tab(widgets))
+        .map(|t| {
+            let w = if open == Some(t) { TAB_W + name_w.min(NAME_ROOM - NAME_PAD) + NAME_PAD } else { TAB_W };
+            let r = Rect::new(x, TAB_Y, w, TAB_H);
+            x += w + TAB_GAP;
+            r
+        })
+        .collect();
+    rects.push(Rect::new(PIN.x - TAB_GAP - TAB_W, TAB_Y, TAB_W, TAB_H));
+    rects
 }
 
 fn tab_title(widgets: &[Box<dyn Widget>], tab: usize) -> &'static str {
@@ -127,13 +149,16 @@ fn tab_named(widgets: &[Box<dyn Widget>], title: &str) -> Option<usize> {
     (0..=widgets.len()).find(|&t| tab_title(widgets, t) == title)
 }
 
-/// The empty stretch of the tab row between the widget tabs and the Settings tab.
+/// The empty stretch of the toolbar between the widget tabs (at their widest) and the
+/// Settings tab.
 fn stretch_rect(widgets: &[Box<dyn Widget>]) -> Rect {
-    let x = tab_rect(widgets, widgets.len()).right() + TAB_GAP;
-    Rect::new(x, 0.0, tab_rect(widgets, settings_tab(widgets)).x - TAB_GAP - x, TAB_BASE)
+    let tabs = settings_tab(widgets) as f32;
+    let x = TABS_X + tabs * (TAB_W + TAB_GAP) + NAME_ROOM + TAB_GAP;
+    let settings = PIN.x - TAB_GAP - TAB_W;
+    Rect::new(x, 0.0, settings - TAB_GAP - x, BAR)
 }
 
-/// The magnifier button at the stretch's right end, shaped like a tab. It opens search.
+/// The magnifier button at the stretch's right end. It opens search.
 fn search_rect(widgets: &[Box<dyn Widget>]) -> Rect {
     Rect::new(stretch_rect(widgets).right() - TAB_W, TAB_Y, TAB_W, TAB_H)
 }
@@ -154,7 +179,7 @@ fn field_text_rect(widgets: &[Box<dyn Widget>]) -> Rect {
 /// screen.
 fn handle_rect(widgets: &[Box<dyn Widget>]) -> Rect {
     let s = stretch_rect(widgets);
-    Rect::new(s.x, 0.0, search_rect(widgets).x - TAB_GAP - s.x, TAB_BASE)
+    Rect::new(s.x, 0.0, search_rect(widgets).x - TAB_GAP - s.x, BAR)
 }
 
 /// Home dashboard cards as (widget index, rect in content coordinates), sized by weight.
@@ -238,6 +263,9 @@ struct Layout {
     h: i32,
     /// The primary monitor's bounds: where the notch slides, and for fullscreen detection.
     monitor: RECT,
+    /// No monitor above this one, so the blur may reach past the top edge (keeping its
+    /// rounded top corners off-screen).
+    room_above: bool,
     surface: Surface,
     fonts: Fonts,
 }
@@ -266,7 +294,7 @@ fn edges(left: f32, width: f32, scale: f32, position: f32) -> (f32, f32) {
 
 impl Layout {
     /// At the top of the primary monitor.
-    unsafe fn primary(dwrite: &IDWriteFactory) -> Result<Self> {
+    unsafe fn primary(dwrite: &IDWriteFactory, numerals: Option<&Numerals>) -> Result<Self> {
         unsafe {
             let mon = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
             let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -278,13 +306,16 @@ impl Layout {
             let w = ((EXPANDED.0 + SHADOW * 2.0) * scale).ceil() as i32;
             let h = ((EXPANDED.1 + SHADOW) * scale).ceil() as i32;
 
+            let m = info.rcMonitor;
+            let above = POINT { x: m.left + (m.right - m.left) / 2, y: m.top - 1 };
             Ok(Self {
                 scale,
                 w,
                 h,
-                monitor: info.rcMonitor,
+                monitor: m,
+                room_above: MonitorFromPoint(above, MONITOR_DEFAULTTONULL).is_invalid(),
                 surface: Surface::new(w, h)?,
-                fonts: Fonts::new(dwrite, scale)?,
+                fonts: Fonts::new(dwrite, numerals, scale)?,
             })
         }
     }
@@ -325,6 +356,13 @@ unsafe fn create_target(d2d: &ID2D1Factory, look: Look) -> Result<(ID2D1DCRender
     }
 }
 
+/// The body's look: the user's colour and opacity, made solid when the user has turned
+/// transparency effects off.
+fn look(settings: &Settings, transparency: bool) -> Look {
+    let look = settings_panel::look(settings);
+    if transparency { look } else { Look { opacity: 1.0, ..look } }
+}
+
 /// A mouse drag in progress; the window has captured the mouse.
 #[derive(Clone, Copy)]
 enum Drag {
@@ -349,6 +387,8 @@ enum Owner {
     Search,
     /// The Settings tab's shortcut recorder.
     Shortcut,
+    /// The Settings tab's weather place field.
+    Place,
 }
 
 /// Keyboard focus the notch took after an explicit user action; see `begin_typing`.
@@ -368,7 +408,15 @@ struct App {
     rt: ID2D1DCRenderTarget,
     brushes: Brushes,
     images: ImageCache,
+    /// The bundled numerals face; `None` falls back to the UI font.
+    numerals: Option<Numerals>,
     layout: Layout,
+    /// Hover and state transitions.
+    motion: Motion,
+    /// The blur behind the glass; `None` where Windows doesn't offer it.
+    backdrop: Option<Backdrop>,
+    /// The user allows transparency effects; without them the glass is solid.
+    transparency: bool,
     widgets: Vec<Box<dyn Widget>>,
     /// The tab shown when expanded: `HOME`, or widget `i` as `i + 1`.
     active: usize,
@@ -397,12 +445,18 @@ struct App {
     keyboard: Option<Keyboard>,
     /// The search field, while search is open.
     search: Option<TextField>,
+    /// The weather place field, while it's being typed in.
+    place_field: Option<TextField>,
+    /// Local weather, for the Time tab; the place comes from Settings.
+    weather: Rc<Weather>,
     /// The widget showing search results (by index into `widgets`), while searching.
     results: Option<usize>,
     /// Pairs UTF-16 surrogates from WM_CHAR.
     joiner: Utf16Joiner,
     /// Windows refused to register the saved shortcut (another app has it).
     hotkey_taken: bool,
+    /// Counts frame ticks, to animate at every other one.
+    frame: u32,
     dirty: bool,
 }
 
@@ -472,13 +526,22 @@ impl App {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let settings = Settings::load();
-            let (rt, brushes) = create_target(&d2d, settings_panel::look(&settings))?;
-            let layout = Layout::primary(&dwrite)?;
-            let mut widgets = widgets::all();
+            let transparency = desktop::transparency_enabled();
+            motion::set_reduced(!desktop::animations_enabled());
+            let (rt, brushes) = create_target(&d2d, look(&settings, transparency))?;
+            let numerals = Numerals::load(&dwrite);
+            let layout = Layout::primary(&dwrite, numerals.as_ref())?;
+            let weather = match settings.place.clone() {
+                Some((_, Some(place))) => Weather::spawn(Some(place), None),
+                Some((query, None)) => Weather::spawn(None, Some(query)),
+                None => Weather::spawn(None, None),
+            };
+            let mut widgets = widgets::all(&weather);
             for w in &mut widgets {
                 w.load(&settings);
             }
             let active = tab_named(&widgets, &settings.tab).unwrap_or(HOME);
+            let backdrop = Backdrop::new(GetModuleHandleW(None)?.into());
 
             Ok(Self {
                 hwnd,
@@ -487,7 +550,11 @@ impl App {
                 rt,
                 brushes,
                 images: ImageCache::default(),
+                numerals,
                 layout,
+                motion: Motion::default(),
+                backdrop,
+                transparency,
                 widgets,
                 active,
                 cursor: None,
@@ -504,9 +571,12 @@ impl App {
                 interactive: true,
                 keyboard: None,
                 search: None,
+                place_field: None,
+                weather,
                 results: None,
                 joiner: Utf16Joiner::default(),
                 hotkey_taken: false,
+                frame: 0,
                 dirty: true,
             })
         }
@@ -514,11 +584,23 @@ impl App {
 
     /// Re-fit to the primary monitor after a resolution, DPI or arrangement change.
     fn relayout(&mut self) {
-        if let Ok(layout) = unsafe { Layout::primary(&self.dwrite) } {
+        if let Ok(layout) = unsafe { Layout::primary(&self.dwrite, self.numerals.as_ref()) } {
             self.layout = layout;
             self.render();
             self.refresh_icon(NIM_MODIFY);
         }
+    }
+
+    /// Re-reads the Windows settings the look follows: transparency effects (solid glass and
+    /// no blur when they're off) and animation effects (no transitions when they're off).
+    fn read_system_settings(&mut self) {
+        motion::set_reduced(!desktop::animations_enabled());
+        let transparency = desktop::transparency_enabled();
+        if transparency != self.transparency {
+            self.transparency = transparency;
+            let _ = unsafe { self.brushes.restyle(&self.rt, look(&self.settings, transparency)) };
+        }
+        self.dirty = true;
     }
 
     /// Redraws the icon for the current DPI and taskbar theme, then adds (`NIM_ADD`) or
@@ -573,9 +655,24 @@ impl App {
         if (color, opacity) != (self.settings.color, self.settings.opacity) {
             self.settings.color = color;
             self.settings.opacity = opacity;
-            let _ = unsafe { self.brushes.restyle(&self.rt, settings_panel::look(&self.settings)) };
+            let _ = unsafe { self.brushes.restyle(&self.rt, look(&self.settings, self.transparency)) };
             self.dirty = true;
         }
+    }
+
+    /// Width of the open tab's name, which widens it.
+    fn tab_name_width(&self, title: &str) -> f32 {
+        // Measuring needs only the fonts and the scale.
+        let cv = Canvas::new(&self.rt, &self.brushes, &self.layout.fonts, &self.images, &self.motion, self.layout.scale, (0.0, 0.0), None);
+        cv.measure(title, Font::Label)
+    }
+
+    /// The tabs as they are now: the open one shows its name, except while searching (the
+    /// field is open instead) and for Settings (which has no room for one).
+    fn tabs(&self) -> Vec<Rect> {
+        let open = (self.search.is_none() && self.active != settings_tab(&self.widgets)).then_some(self.active);
+        let name_w = open.map_or(0.0, |t| self.tab_name_width(tab_title(&self.widgets, t)));
+        tab_rects(&self.widgets, open, name_w)
     }
 
     fn placement(&self) -> Placement {
@@ -599,9 +696,19 @@ impl App {
     }
 
     /// Whether the cursor is over the open search field.
+    /// Whether the cursor is over a text field: the open search field, or the Weather field
+    /// on the Settings tab.
     fn over_field(&self) -> bool {
         let (x, y) = self.cursor_logical();
-        self.t >= 0.9 && self.search.is_some() && field_rect(&self.widgets).contains(x, y)
+        let place = settings_panel::place_text_rect().inset(-10.0);
+        let over_place = self.active == settings_tab(&self.widgets)
+            && self.search.is_none()
+            && place.contains(x - CONTENT.x, y - CONTENT.y);
+        self.t >= 0.9 && (over_place || self.search.is_some() && field_rect(&self.widgets).contains(x, y))
+    }
+
+    fn editing_place(&self) -> bool {
+        self.keyboard.as_ref().is_some_and(|kb| kb.owner == Owner::Place)
     }
 
     /// Takes keyboard focus for `owner`. Only call straight from an explicit user action: a
@@ -642,6 +749,8 @@ impl App {
             // Every way out of recording (a key, Esc, a click anywhere) registers whatever is
             // saved now.
             Owner::Shortcut => self.register_hotkey(),
+            // Leaving the field without Enter keeps the saved place.
+            Owner::Place => self.place_field = None,
         }
         self.joiner = Utf16Joiner::default();
         self.dirty = true;
@@ -684,6 +793,7 @@ impl App {
             Some(Owner::Search) => self.end_typing(true),
             // Can't happen: nothing is registered while recording.
             Some(Owner::Shortcut) => {}
+            Some(Owner::Place) => self.end_typing(true),
             None => {
                 self.unhide();
                 self.open_search();
@@ -795,18 +905,76 @@ impl App {
         self.dirty = true;
     }
 
-    /// A click in the search field, at expanded-layout x: moves the caret there (Shift
-    /// extends the selection).
+    /// The text field the keyboard is typing into, if any.
+    fn typing_field(&mut self) -> Option<&mut TextField> {
+        match self.keyboard.as_ref()?.owner {
+            Owner::Search => self.search.as_mut(),
+            Owner::Place => self.place_field.as_mut(),
+            Owner::Shortcut => None,
+        }
+    }
+
+    /// Where the text of the field being typed in is drawn, in expanded-layout coordinates.
+    fn typing_rect(&self) -> Option<Rect> {
+        match self.keyboard.as_ref()?.owner {
+            Owner::Search => Some(field_text_rect(&self.widgets)),
+            Owner::Place => {
+                let r = settings_panel::place_text_rect();
+                Some(Rect { x: r.x + CONTENT.x, y: r.y + CONTENT.y, ..r })
+            }
+            Owner::Shortcut => None,
+        }
+    }
+
+    /// A click in the field being typed in, at expanded-layout x: moves the caret there
+    /// (Shift extends the selection).
     fn place_caret(&mut self, x: f32) {
-        let r = field_text_rect(&self.widgets);
-        let Some(field) = &self.search else { return };
+        let Some(r) = self.typing_rect() else { return };
         // Measuring needs only the fonts and the scale.
-        let cv = Canvas::new(&self.rt, &self.brushes, &self.layout.fonts, &self.images, self.layout.scale, (0.0, 0.0), None);
-        let at = text::caret_at(&cv, field, r, Font::Body, x);
-        if let Some(field) = &mut self.search {
+        let cv = Canvas::new(&self.rt, &self.brushes, &self.layout.fonts, &self.images, &self.motion, self.layout.scale, (0.0, 0.0), None);
+        let field = match self.keyboard.as_ref().map(|kb| kb.owner) {
+            Some(Owner::Search) => self.search.as_ref(),
+            Some(Owner::Place) => self.place_field.as_ref(),
+            _ => None,
+        };
+        let Some(at) = field.map(|f| text::caret_at(&cv, f, r, Font::Body, x)) else { return };
+        if let Some(field) = self.typing_field() {
             field.set_caret(at, key_down(VK_SHIFT));
         }
         self.edited();
+    }
+
+    /// The Weather field was clicked: type a city or ZIP, starting from the saved one (all
+    /// selected, so typing replaces it).
+    fn start_place(&mut self) {
+        let mut field = TextField::new(settings_panel::PLACE_MAX);
+        if let Some((query, _)) = &self.settings.place {
+            field.insert(query);
+            field.select_all();
+        }
+        self.place_field = Some(field);
+        if !self.begin_typing(Owner::Place) {
+            self.place_field = None;
+        }
+        self.dirty = true;
+    }
+
+    /// Enter in the Weather field: save what was typed and look it up. Empty turns the
+    /// weather off; the same place, already found, changes nothing.
+    fn commit_place(&mut self) {
+        let typed = self.place_field.as_ref().map(|f| f.text().trim().to_owned()).unwrap_or_default();
+        let unchanged = self.settings.place.as_ref().is_some_and(|(q, found)| *q == typed && found.is_some());
+        if typed.is_empty() {
+            if self.settings.place.take().is_some() {
+                self.weather.clear();
+                self.settings.save();
+            }
+        } else if !unchanged {
+            self.weather.lookup(&typed);
+            self.settings.place = Some((typed, None));
+            self.settings.save();
+        }
+        self.end_typing(true);
     }
 
     /// A key went down while the notch may hold the keyboard. Returns whether it was used;
@@ -845,15 +1013,21 @@ impl App {
                     return true;
                 }
                 let Some(command) = text::command(vk, ctrl, shift) else { return false };
-                self.search_command(command);
+                self.field_command(command);
+            }
+            Owner::Place => {
+                let Some(command) = text::command(vk, ctrl, shift) else { return false };
+                self.field_command(command);
             }
         }
         true
     }
 
-    fn search_command(&mut self, command: Command) {
+    /// An editing command for the field being typed in.
+    fn field_command(&mut self, command: Command) {
         let hwnd = self.hwnd;
-        let Some(field) = &mut self.search else { return };
+        let Some(owner) = self.keyboard.as_ref().map(|kb| kb.owner) else { return };
+        let Some(field) = self.typing_field() else { return };
         let before = field.text().to_owned();
         match command {
             Command::Move(motion, extend) => field.move_caret(motion, extend),
@@ -877,7 +1051,10 @@ impl App {
                 }
             }
             Command::Submit => {
-                self.search_key(SearchKey::Enter);
+                match owner {
+                    Owner::Place => self.commit_place(),
+                    _ => self.search_key(SearchKey::Enter),
+                }
                 return;
             }
             Command::Cancel => {
@@ -886,9 +1063,9 @@ impl App {
             }
         }
         // Only a real text change re-runs the search, so caret moves keep the highlight.
-        let changed = self.search.as_ref().is_some_and(|field| field.text() != before);
+        let changed = self.typing_field().is_some_and(|field| field.text() != before);
         self.edited();
-        if changed {
+        if changed && owner == Owner::Search {
             self.query_changed();
         }
     }
@@ -910,6 +1087,12 @@ impl App {
                     if changed {
                         self.query_changed();
                     }
+                }
+                Owner::Place => {
+                    if let Some(field) = &mut self.place_field {
+                        field.insert(c.encode_utf8(&mut [0; 4]));
+                    }
+                    self.edited();
                 }
             }
         }
@@ -943,6 +1126,15 @@ impl App {
         if updated {
             self.dirty = true;
             self.persist_widgets();
+        }
+        // The weather: redraw when it changes, and save a place once it's been found.
+        let (changed, found) = self.weather.poll();
+        self.dirty |= changed;
+        if let Some((query, place)) = found
+            && self.settings.place.as_ref().is_some_and(|(q, _)| *q == query)
+        {
+            self.settings.place = Some((query, Some(place)));
+            self.settings.save();
         }
         if let Some(i) = self.widgets.iter_mut().position(|w| w.take_attention()) {
             // E.g. a focus session ended: pop open on that widget, with a chime.
@@ -1057,11 +1249,33 @@ impl App {
         self.target = target;
 
         if self.t != target {
-            self.t = approach(self.t, target, 0.22);
+            self.t = if motion::reduced() { target } else { approach(self.t, target, ANIMATION_STEP) };
+            self.dirty = true;
+        }
+        // A running timer or stopwatch on screen moves: about 30 frames a second.
+        self.frame = self.frame.wrapping_add(1);
+        if self.frame.is_multiple_of(2) && self.animating() {
             self.dirty = true;
         }
         if self.dirty {
             self.render();
+        }
+    }
+
+    /// Whether something on screen is animating by itself: a running timer or stopwatch on
+    /// the open tab (or Home's timer card), or the rail's live dot while one runs.
+    fn animating(&self) -> bool {
+        if motion::reduced() || self.hidden {
+            return false;
+        }
+        if self.t < 0.5 {
+            return self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating());
+        }
+        match self.active {
+            _ if self.search.is_some() => false,
+            HOME => self.widgets.iter().any(|w| w.card_weight().is_some() && w.card_animating()),
+            t if t == settings_tab(&self.widgets) => false,
+            t => self.widgets[t - 1].animating(),
         }
     }
 
@@ -1075,7 +1289,7 @@ impl App {
 
         if PIN.contains(lx, ly) {
             self.toggle_pin();
-        } else if let Some(t) = (0..tab_count(&self.widgets)).find(|&t| tab_rect(&self.widgets, t).contains(lx, ly)) {
+        } else if let Some(t) = self.tabs().iter().position(|r| r.contains(lx, ly)) {
             // Picking a tab while typing (searching or recording) ends it and gives the focus
             // back.
             self.end_typing(true);
@@ -1083,6 +1297,13 @@ impl App {
         } else if self.recording() {
             // Any other press, the chip included, stops recording and keeps the shortcut.
             self.end_typing(true);
+        } else if self.editing_place() {
+            // A press in the field places the caret; anywhere else leaves it, unsaved.
+            if self.typing_rect().is_some_and(|r| r.contains(lx, ly)) {
+                self.place_caret(lx);
+            } else {
+                self.end_typing(true);
+            }
         } else if self.search.is_some() {
             // While searching, only the field (placing the caret) and the results take clicks.
             if field_rect(&self.widgets).contains(lx, ly) {
@@ -1117,6 +1338,7 @@ impl App {
                     self.dirty = true;
                 }
                 Hit::Shortcut => self.start_recording(),
+                Hit::Place => self.start_place(),
             }
         } else if CONTENT.contains(lx, ly) {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
@@ -1237,6 +1459,7 @@ impl App {
 
     fn render(&mut self) {
         self.dirty = false;
+        self.motion.begin(Instant::now());
         let l = &self.layout;
         let s = l.scale;
         let (nw, nh) = self.notch_size();
@@ -1254,18 +1477,16 @@ impl App {
 
             // Body: extend above the window so the top corners stay flat. The shadow fades in
             // with expansion and is absent when collapsed, keeping click-through exact.
-            let canvas =
-                |origin: f32, cursor| Canvas::new(&self.rt, &self.brushes, &l.fonts, &self.images, s, (origin, 0.0), cursor);
+            let canvas = |origin: f32, cursor| {
+                Canvas::new(&self.rt, &self.brushes, &l.fonts, &self.images, &self.motion, s, (origin, 0.0), cursor)
+            };
             let body = canvas(left, None);
             body.glass(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, e);
 
-            // Collapsed content: the top-priority widget's one-line readout.
-            if e < 0.5
-                && let Some((_, compact)) = self.compact()
-            {
+            // Collapsed: the rail, with the clock and the top-priority widget's readout.
+            if e < 0.5 {
                 self.brushes.set_content_opacity(1.0 - e * 2.0);
-                let r = Rect::new(14.0, 0.0, nw / s - 28.0, nh / s);
-                body.text(&compact.text, Font::Small, Ink::Dim, r, Align::Center);
+                self.draw_rail(&body, nw / s, nh / s);
             }
 
             // Expanded content: fixed layout, clipped to the animating body.
@@ -1287,13 +1508,19 @@ impl App {
                     }
                 } else if self.active == HOME {
                     for (i, r) in home_cards(&self.widgets) {
-                        content.fill(r, CARD_RADIUS, Ink::Track);
+                        content.card(r, CARD_RADIUS, if self.widgets[i].card_lit() { 0.6 } else { 0.0 });
+                        if self.widgets[i].card_animating() {
+                            widgets::running_edge(&content, r, Ink::Accent);
+                        }
                         let inner = content.offset(r.x + CARD_PAD, r.y + CARD_PAD);
                         self.widgets[i].draw_card(&inner, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0);
                     }
                 } else if self.active == settings_tab(&self.widgets) {
                     let shortcut = ShortcutRow { recording: self.recording(), taken: self.hotkey_taken };
-                    settings_panel::draw(&content, CONTENT.w, &self.settings, shortcut);
+                    let caret_on = self.keyboard.as_ref().is_some_and(|kb| kb.caret_on);
+                    let editing = self.place_field.as_ref().filter(|_| self.editing_place()).map(|f| (f, caret_on));
+                    let place = PlaceRow { editing, status: self.weather.status() };
+                    settings_panel::draw(&content, CONTENT.w, &self.settings, shortcut, place);
                 } else {
                     self.widgets[self.active - 1].draw(&content, CONTENT.w, CONTENT.h);
                 }
@@ -1304,7 +1531,7 @@ impl App {
                 Ok(()) => {}
                 Err(err) if err.code() == D2DERR_RECREATE_TARGET => {
                     // Device lost: rebuild the target and brushes, redraw next tick.
-                    if let Ok((rt, brushes)) = create_target(&self.d2d, settings_panel::look(&self.settings)) {
+                    if let Ok((rt, brushes)) = create_target(&self.d2d, look(&self.settings, self.transparency)) {
                         self.rt = rt;
                         self.brushes = brushes;
                         self.images.clear();
@@ -1336,71 +1563,183 @@ impl App {
                 ULW_ALPHA,
             );
         }
+
+        let blur = self.blur_rect();
+        if let Some(backdrop) = &mut self.backdrop {
+            backdrop.place(self.hwnd, blur);
+        }
+        // A transition still under way needs another frame.
+        if self.motion.end() {
+            self.dirty = true;
+        }
     }
 
-    /// The tab row: outlined tabs standing on a line that opens under the open tab (or the
-    /// search field), so it joins the panel below; the name of the tab under the cursor (else
-    /// the open one); the slide handle's grip; the search button or field; and the pin.
+    /// The body in screen px at expansion `t`: its left, right and bottom (its top is the
+    /// monitor's).
+    fn body_at(&self, t: f32) -> (f32, f32, f32) {
+        let s = self.layout.scale;
+        let p = self.layout.place(self.settings.position, t);
+        let e = ease(t);
+        let left = p.x as f32 + p.body;
+        (left, left + lerp(COLLAPSED.0, EXPANDED.0, e) * s, p.y as f32 + lerp(COLLAPSED.1, EXPANDED.1, e) * s)
+    }
+
+    /// Where the blur goes: inside the body, both where it is now and where it will be next
+    /// frame (the blur window can lag the notch by a frame, and must never show past the
+    /// glass). `None` hides it: while hidden or fading, with transparency effects off, or
+    /// when the glass is solid anyway.
+    fn blur_rect(&self) -> Option<RECT> {
+        if self.hidden || self.fade < 1.0 || !self.transparency || self.settings.opacity >= 100 {
+            return None;
+        }
+        let next = if motion::reduced() { self.target } else { approach(self.t, self.target, ANIMATION_STEP) };
+        let (now, then) = (self.body_at(self.t), self.body_at(next));
+        let inset = BLUR_INSET * self.layout.scale;
+        let left = now.0.max(then.0) + inset;
+        let right = now.1.min(then.1) - inset;
+        let bottom = now.2.min(then.2) - inset;
+        // Up past the screen's top edge when nothing is there, so only the bottom corners
+        // are rounded, like the glass's.
+        let lift = if self.layout.room_above { backdrop::CORNER * self.layout.scale } else { 0.0 };
+        let top = self.layout.monitor.top as f32 - lift;
+        (right > left && bottom > top).then(|| RECT {
+            left: left.ceil() as i32,
+            top: top as i32,
+            right: right.floor() as i32,
+            bottom: bottom.floor() as i32,
+        })
+    }
+
+    /// The collapsed notch: the time on the left, the top-priority widget's readout (a
+    /// running timer, the song playing, CPU and RAM) on the right, and a hairline of
+    /// progress along the bottom while a timer runs or a song plays.
+    fn draw_rail(&self, cv: &Canvas, w: f32, h: f32) {
+        let baseline = h / 2.0 + 5.0;
+        let (time, marker) = widgets::now_short();
+        let mut x = 16.0 + cv.numerals(&[(time.as_str(), Font::Numeral, Ink::Text)], 16.0, baseline, Align::Left);
+        if !marker.is_empty() {
+            let r = Rect::new(x + 3.0, baseline - 11.0, 24.0, 12.0);
+            cv.caps(&marker, Font::Caption, Ink::Dim, r, Align::Left);
+            x += 3.0 + cv.measure(&marker, Font::Caption) + 2.0;
+        }
+        let Some((i, compact)) = self.compact() else { return };
+        cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
+        let mut x = x + 18.0;
+        if compact.live {
+            // It breathes while a timer or stopwatch runs.
+            let swell = if self.widgets[i].animating() && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
+            cv.halo(x + 2.5, h / 2.0, 2.0 + 1.5 * swell, Ink::Accent, 0.3 + 0.7 * swell);
+            cv.circle(x + 2.5, h / 2.0, 2.5, Ink::Accent, None);
+            x += 10.0;
+        }
+        let ink = if compact.live { Ink::Text } else { Ink::Dim };
+        cv.text(&compact.text, Font::Small, ink, Rect::new(x, 0.0, w - x - 16.0, h), Align::Left);
+        if let Some(done) = compact.progress {
+            let track = Rect::new(RADIUS, h - 3.0, w - RADIUS * 2.0, 1.5);
+            cv.fill(track, 0.75, Ink::Line);
+            cv.fill(Rect { w: track.w * done.clamp(0.0, 1.0), ..track }, 0.75, Ink::Accent);
+        }
+    }
+
+    /// One toolbar control's background: glass under the cursor, and cyan glass with a
+    /// glowing underline while `lit` (0..=1: the open tab, the search field).
+    fn draw_tab_back(cv: &Canvas, r: Rect, hot: f32, lit: f32) {
+        cv.fill_a(r, TAB_RADIUS, Ink::Hover, hot * (1.0 - lit));
+        cv.fill_a(r, TAB_RADIUS, Ink::Lit, lit);
+        cv.outline(r, TAB_RADIUS, Ink::LitEdge, 0.8 * lit);
+        cv.beam(r.x + 6.0, r.right() - 6.0, BAR - 0.5, lit);
+    }
+
+    /// A toolbar icon, dim at rest and brightening by `bright` (hovered or lit).
+    fn draw_tab_icon(cv: &Canvas, icon: &str, r: Rect, bright: f32) {
+        cv.text(icon, Font::Icon, Ink::Dim, r, Align::Center);
+        cv.text_a(icon, Font::Icon, Ink::Text, r, Align::Center, bright);
+    }
+
+    /// The toolbar: the brand mark; icon tabs, the open one lit and showing its name; the
+    /// hovered tab's name and the slide handle's grip in the empty stretch; the search button
+    /// (or the open search field), Settings and the pin; and a hairline under it all.
     fn draw_tabs(&self, cv: &Canvas) {
         let widgets = &self.widgets;
         let searching = self.search.is_some();
-        let open = if searching { field_rect(widgets) } else { tab_rect(widgets, self.active) };
-        let y = TAB_BASE - 0.5;
-        cv.line((PAD / 2.0, y), (open.x + 0.5, y), Ink::Edge);
-        cv.line((open.right() - 0.5, y), (EXPANDED.0 - PAD / 2.0, y), Ink::Edge);
+        cv.line((PAD, BAR - 0.5), (EXPANDED.0 - PAD, BAR - 0.5), Ink::Line);
 
-        let mut named = tab_title(widgets, self.active);
-        for t in 0..tab_count(widgets) {
-            let r = tab_rect(widgets, t);
-            let hot = cv.hovered(r);
-            if hot {
-                named = tab_title(widgets, t);
+        // The mark: a lit ring around a core, with a planet in orbit just outside it.
+        let (mx, my) = (LOGO.x + LOGO.w / 2.0 - 1.0, LOGO.y + LOGO.h / 2.0 + 1.0);
+        cv.halo(mx, my, 7.0, Ink::Accent, 0.35);
+        cv.ring(mx, my, 7.0, 1.6, 1.0, None, 1.0);
+        cv.circle(mx, my, 2.4, Ink::Text, None);
+        let orbit = 11.0 * std::f32::consts::FRAC_1_SQRT_2;
+        let (px, py) = (mx + orbit, my - orbit);
+        cv.halo(px, py, 2.0, Ink::Violet, 0.5);
+        cv.circle(px, py, 2.0, Ink::Violet, None);
+        cv.line((DIVIDER_X, TAB_Y + 7.0), (DIVIDER_X, TAB_Y + TAB_H - 7.0), Ink::Line);
+
+        let mut named = None;
+        for (t, target) in self.tabs().into_iter().enumerate() {
+            // The open tab widens smoothly as it opens, nudging the ones after it along.
+            let x = cv.ease(motion::key(("tab-x", t)), target.x, timing::STATE);
+            let w = cv.ease(motion::key(("tab-w", t)), target.w, timing::STATE);
+            let r = Rect { x, w, ..target };
+            let open = t == self.active && !searching;
+            let lit = cv.ease(motion::key(("tab-lit", t)), f32::from(u8::from(open)), timing::STATE);
+            let hot = cv.hover(target);
+            if cv.hovered(target) && !open {
+                named = Some(tab_title(widgets, t));
             }
-            let (fill, edge, ink) = match (t == self.active && !searching, hot) {
-                (true, _) => (Some(Ink::Track), Ink::Edge, Ink::Text),
-                (false, true) => (Some(Ink::Track), Ink::Line, Ink::Text),
-                (false, false) => (None, Ink::Line, Ink::Dim),
-            };
-            cv.tab(r, TAB_RADIUS, fill, Some(edge));
-            cv.text(tab_icon(widgets, t), Font::Icon, ink, r, Align::Center);
+            Self::draw_tab_back(cv, r, hot, lit);
+            Self::draw_tab_icon(cv, tab_icon(widgets, t), Rect { w: TAB_W, ..r }, hot.max(lit));
+            if r.w > TAB_W + 1.0 {
+                cv.push_clip(r);
+                let name = Rect::new(r.x + TAB_W - 4.0, r.y, NAME_ROOM, r.h);
+                cv.text_a(tab_title(widgets, t), Font::Label, Ink::Text, name, Align::Left, lit);
+                cv.pop_clip();
+            }
         }
 
         if let Some(field) = &self.search {
-            // The field looks like the open tab: filled, edged, joined to the panel.
+            // The field is the open control now: lit, holding the keyboard.
             let f = field_rect(widgets);
-            cv.tab(f, TAB_RADIUS, Some(Ink::Track), Some(Ink::Edge));
-            cv.text(glyph::SEARCH, Font::Icon, Ink::Dim, Rect { w: FIELD_ICON, ..f }, Align::Center);
+            let lit = cv.ease(motion::key("field"), 1.0, timing::STATE);
+            Self::draw_tab_back(cv, f, 0.0, lit);
+            cv.text(glyph::SEARCH, Font::Icon, Ink::Accent, Rect { w: FIELD_ICON, ..f }, Align::Center);
             let caret_on = self.keyboard.as_ref().is_some_and(|kb| kb.caret_on);
             text::draw(cv, field, field_text_rect(widgets), Font::Body, "Search apps", caret_on);
         } else {
             let search = search_rect(widgets);
-            let search_hot = cv.hovered(search);
-            if search_hot {
-                named = "Search";
+            if cv.hovered(search) {
+                named = Some("Search");
             }
             let handle = handle_rect(widgets);
-            // The name stops short of the grip in the middle.
-            let label = Rect::new(handle.x + 8.0, TAB_Y, handle.w / 2.0 - 20.0, TAB_H);
-            cv.text(named, Font::Label, Ink::Dim, label, Align::Left);
+            // The hovered tab's name, left of the grip.
+            if let Some(name) = named {
+                let label = Rect::new(handle.x + 8.0, TAB_Y, handle.w / 2.0 - 24.0, TAB_H);
+                cv.text(name, Font::Small, Ink::Dim, label, Align::Left);
+            }
             // Grip: two rows of three dots, centred in the handle.
-            let hot = matches!(self.drag, Some(Drag::Slide { .. })) || cv.hovered(handle);
+            let dragging = matches!(self.drag, Some(Drag::Slide { .. }));
+            let hot = if dragging { 1.0 } else { cv.hover(handle) };
             let (cx, cy) = (handle.x + handle.w / 2.0, TAB_Y + TAB_H / 2.0);
             for (dx, dy) in [-5.0, 0.0, 5.0].into_iter().flat_map(|dx| [(dx, -2.5), (dx, 2.5)]) {
-                cv.circle(cx + dx, cy + dy, 1.25, if hot { Ink::Text } else { Ink::Dim }, None);
+                cv.circle_a(cx + dx, cy + dy, 1.25, Ink::Dim, None, 0.7);
+                cv.circle_a(cx + dx, cy + dy, 1.25, Ink::Text, None, hot);
             }
-            // The search button, drawn like an unselected tab.
-            cv.tab(search, TAB_RADIUS, search_hot.then_some(Ink::Track), Some(Ink::Line));
-            cv.text(glyph::SEARCH, Font::Icon, if search_hot { Ink::Text } else { Ink::Dim }, search, Align::Center);
+            let hot = cv.hover(search);
+            Self::draw_tab_back(cv, search, hot, 0.0);
+            Self::draw_tab_icon(cv, glyph::SEARCH, search, hot);
         }
 
-        let (pin, ink) = match (self.settings.pinned, cv.hovered(PIN)) {
-            (true, _) => (glyph::PINNED, Ink::Accent),
-            (false, true) => (glyph::PIN, Ink::Text),
-            (false, false) => (glyph::PIN, Ink::Dim),
-        };
-        cv.text(pin, Font::Icon, ink, PIN, Align::Center);
+        let hot = cv.hover(PIN);
+        Self::draw_tab_back(cv, PIN, hot, 0.0);
+        if self.settings.pinned {
+            cv.halo(PIN.x + PIN.w / 2.0, PIN.y + PIN.h / 2.0, 6.0, Ink::Accent, 0.25);
+            cv.text(glyph::PINNED, Font::Icon, Ink::Accent, PIN, Align::Center);
+        } else {
+            Self::draw_tab_icon(cv, glyph::PIN, PIN, hot);
+        }
     }
 }
+
 
 /// Whether (`x`, `y`), relative to the body's top-left, is inside a `w` x `h` notch whose
 /// bottom corners are rounded by `r` (the top corners are off-screen).
@@ -1663,11 +2002,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        // Light/dark theme switched: redraw the tray icon to match the taskbar.
-        WM_SETTINGCHANGE if lparam.0 != 0 && unsafe { PCWSTR(lparam.0 as *const u16).to_string() }
-            .is_ok_and(|s| s == "ImmersiveColorSet") =>
-        {
-            with_app(|a| a.refresh_icon(NIM_MODIFY));
+        // Transparency or animation effects may have changed; and if the light/dark theme
+        // switched, redraw the tray icon to match the taskbar.
+        WM_SETTINGCHANGE => {
+            let theme = lparam.0 != 0
+                && unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet");
+            with_app(|a| {
+                a.read_system_settings();
+                if theme {
+                    a.refresh_icon(NIM_MODIFY);
+                }
+            });
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1731,8 +2076,8 @@ mod tests {
     #[test]
     fn search_button_and_field_share_the_tab_row_stretch() {
         use super::{
-            Canvas, Compact, Instant, Rect, TAB_GAP, Widget, field_rect, field_text_rect, handle_rect, search_rect,
-            settings_tab, stretch_rect, tab_rect,
+            Canvas, Compact, Instant, NAME_PAD, NAME_ROOM, Rect, TAB_GAP, TAB_W, Widget, field_rect, field_text_rect,
+            handle_rect, search_rect, settings_tab, stretch_rect, tab_rects,
         };
         // Not `widgets::all()`, which starts the media worker and a clipboard window.
         struct Dummy;
@@ -1755,13 +2100,21 @@ mod tests {
         let parts = |r: Rect| (r.x, r.y, r.w, r.h);
         let (stretch, search, field) = (stretch_rect(&widgets), search_rect(&widgets), field_rect(&widgets));
         let handle = handle_rect(&widgets);
-        assert_eq!(parts(stretch), (312.0, 0.0, 304.0, 40.0));
-        assert_eq!(parts(search), (572.0, 8.0, 44.0, 32.0));
-        assert_eq!(parts(field), (312.0, 8.0, 304.0, 32.0));
-        assert_eq!(parts(field_text_rect(&widgets)), (344.0, 8.0, 262.0, 32.0));
-        assert_eq!(parts(handle), (312.0, 0.0, 256.0, 40.0));
+        assert_eq!(parts(stretch), (332.0, 0.0, 306.0, 44.0));
+        assert_eq!(parts(search), (606.0, 7.0, 32.0, 30.0));
+        assert_eq!(parts(field), (332.0, 7.0, 306.0, 30.0));
+        assert_eq!(parts(field_text_rect(&widgets)), (364.0, 7.0, 264.0, 30.0));
+        assert_eq!(parts(handle), (332.0, 0.0, 272.0, 44.0));
         assert_eq!(handle.right() + TAB_GAP, search.x, "the handle stops short of the button");
         assert_eq!(search.right(), field.right(), "the field covers the button");
-        assert_eq!(field.right() + TAB_GAP, tab_rect(&widgets, settings_tab(&widgets)).x);
+        let tabs = tab_rects(&widgets, None, 0.0);
+        assert_eq!(field.right() + TAB_GAP, tabs[settings_tab(&widgets)].x);
+        // The last tab open, with a name far too long: it stops short of the stretch.
+        let tabs = tab_rects(&widgets, Some(5), 1000.0);
+        assert!(tabs[5].right() + TAB_GAP <= stretch.x, "{:?}", tabs[5]);
+        assert_eq!(tabs[5].w, TAB_W + NAME_ROOM, "the name gets the room there is");
+        let tabs = tab_rects(&widgets, Some(2), 30.0);
+        assert_eq!((tabs[2].w, tabs[3].x), (TAB_W + 30.0 + NAME_PAD, tabs[2].right() + TAB_GAP), "the rest move along");
+        assert_eq!(tabs[1].w, TAB_W);
     }
 }

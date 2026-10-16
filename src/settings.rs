@@ -6,9 +6,16 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::hotkey::Hotkey;
+use crate::weather::Place;
 
-/// The default body colour, obsidian, as `0xRRGGBB`.
-pub const DEFAULT_COLOR: u32 = 0x0B0912;
+/// The default body colour, the Halo glass tint (`theme::color::GLASS`), as `0xRRGGBB`.
+pub const DEFAULT_COLOR: u32 = crate::theme::color::GLASS.hex();
+/// The default body opacity, in percent: see-through enough for the wallpaper to show.
+pub const DEFAULT_OPACITY: u32 = 60;
+/// The default colour before the Halo look.
+pub const OBSIDIAN: u32 = 0x0B0912;
+/// Written to every saved file, so a file without it predates the Halo look.
+const STYLE: &str = "halo";
 /// The most see-through the body may be, in percent.
 pub const OPACITY_MIN: u32 = 10;
 
@@ -31,6 +38,9 @@ pub struct Settings {
     pub position: f32,
     /// The global shortcut that opens app search; `None` = no shortcut.
     pub hotkey: Option<Hotkey>,
+    /// Where the weather is for: what the user typed, and the place it was found to be
+    /// (`None` until looked up, or if nothing matched).
+    pub place: Option<(String, Option<Place>)>,
 }
 
 impl Default for Settings {
@@ -42,9 +52,10 @@ impl Default for Settings {
             focus_minutes: 25,
             apps: None,
             color: DEFAULT_COLOR,
-            opacity: 100,
+            opacity: DEFAULT_OPACITY,
             position: 0.5,
             hotkey: Some(Hotkey::DEFAULT),
+            place: None,
         }
     }
 }
@@ -69,6 +80,8 @@ impl Settings {
 
     fn parse(text: &str) -> Self {
         let mut s = Self::default();
+        let mut styled = false;
+        let (mut query, mut name, mut lat, mut lon) = (None, None, None, None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             let value = value.trim();
@@ -111,8 +124,25 @@ impl Settings {
                 // rather than quietly turning the shortcut off.
                 "hotkey" if value.is_empty() => s.hotkey = None,
                 "hotkey" => s.hotkey = Some(Hotkey::parse(value).unwrap_or(Hotkey::DEFAULT)),
+                "style" => styled = value == STYLE,
+                "place" if !value.is_empty() => query = Some(value.to_string()),
+                "place_name" => name = Some(value.to_string()),
+                "place_lat" => lat = value.parse::<f64>().ok().filter(|v| (-90.0..=90.0).contains(v)),
+                "place_lon" => lon = value.parse::<f64>().ok().filter(|v| (-180.0..=180.0).contains(v)),
                 _ => {}
             }
+        }
+        s.place = query.map(|q| {
+            let found = match (name, lat, lon) {
+                (Some(name), Some(lat), Some(lon)) => Some(Place { name, lat, lon }),
+                _ => None,
+            };
+            (q, found)
+        });
+        // Saved before the Halo look, with the colour never changed from the old default:
+        // move to the new default glass, once.
+        if !styled && s.color == OBSIDIAN {
+            (s.color, s.opacity) = (DEFAULT_COLOR, DEFAULT_OPACITY);
         }
         s
     }
@@ -133,6 +163,13 @@ impl Settings {
         }
         // Always written, so "none" stays distinct from "never set" (the default).
         text += &format!("hotkey={}\n", self.hotkey.map(|h| h.to_string()).unwrap_or_default());
+        if let Some((query, found)) = &self.place {
+            text += &format!("place={query}\n");
+            if let Some(p) = found {
+                text += &format!("place_name={}\nplace_lat={}\nplace_lon={}\n", p.name, p.lat, p.lon);
+            }
+        }
+        text += &format!("style={STYLE}\n");
         text
     }
 }
@@ -144,6 +181,7 @@ fn path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+    use crate::weather::Place;
     use crate::hotkey::Hotkey;
 
     #[test]
@@ -158,6 +196,7 @@ mod tests {
             opacity: 65,
             position: 0.3125,
             hotkey: Some(Hotkey { ctrl: true, alt: false, shift: true, win: false, vk: 0x4B }),
+            place: Some(("02139".into(), Some(Place { name: "Cambridge, Massachusetts".into(), lat: 42.3751, lon: -71.10561 }))),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
         let apps = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Brave".to_string()];
@@ -167,6 +206,10 @@ mod tests {
         assert_eq!(Settings::parse(&s.serialize()), s, "all unpinned stays distinct from never set");
         let s = Settings { hotkey: None, ..s };
         assert_eq!(Settings::parse(&s.serialize()), s, "no shortcut stays distinct from never set");
+        let s = Settings { place: Some(("Atlantis".into(), None)), ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s, "a place not found yet keeps its query");
+        let s = Settings { place: None, ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s);
     }
 
     #[test]
@@ -196,6 +239,16 @@ mod tests {
         assert_eq!(Settings::parse("opacity=250").opacity, 100);
         assert_eq!(Settings::parse("position=-2").position, 0.0);
         assert_eq!(Settings::parse("position=7.5").position, 1.0);
+    }
+
+    #[test]
+    fn an_untouched_obsidian_notch_moves_to_halo_once() {
+        let old = Settings::parse("color=0B0912\nopacity=35\n");
+        assert_eq!((old.color, old.opacity), (super::DEFAULT_COLOR, super::DEFAULT_OPACITY));
+        let picked = Settings { color: super::OBSIDIAN, opacity: 35, ..Settings::default() };
+        assert_eq!(Settings::parse(&picked.serialize()), picked, "obsidian picked since then stays");
+        let custom = Settings::parse("color=14285A\nopacity=35\n");
+        assert_eq!((custom.color, custom.opacity), (0x14285A, 35), "a colour the user picked stays");
     }
 
     #[test]

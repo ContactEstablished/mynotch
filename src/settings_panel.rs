@@ -20,12 +20,16 @@ use windows::{
 };
 
 use crate::gfx::{Align, Canvas, Font, Ink, Look, Rect, Rgb, glyph};
+use crate::theme::{color, space};
 use crate::settings::{OPACITY_MIN, Settings};
+use crate::text::{self, TextField};
+use crate::weather::Status;
 use crate::widgets::{slider, slider_at, slider_hit};
 
 /// Colour presets, deep enough for white text to stay readable. The first is the default.
-pub const PRESETS: [(&str, u32); 9] = [
-    ("Obsidian", crate::settings::DEFAULT_COLOR),
+pub const PRESETS: [(&str, u32); 10] = [
+    ("Halo", crate::settings::DEFAULT_COLOR),
+    ("Obsidian", crate::settings::OBSIDIAN),
     ("Graphite", 0x2A2A30),
     ("Slate", 0x26344A),
     ("Navy", 0x14285A),
@@ -38,23 +42,26 @@ pub const PRESETS: [(&str, u32); 9] = [
 /// Opacity moves in steps of this many percent.
 const STEP: u32 = 5;
 
-/// Four rows fill the 176 px content area: 4 + 4 × 43.
-const ROW_H: f32 = 43.0;
-const ROW_Y: f32 = 4.0;
-// 176 is the content area's height (`CONTENT` in app.rs).
-const _: () = assert!(ROW_Y + ROW_H * 4.0 <= 176.0, "the Settings rows must fit the panel");
+/// Five rows fill the 146 px content area: 0.5 + 5 × 29.
+const ROW_H: f32 = 29.0;
+const ROW_Y: f32 = 0.5;
+const ROWS: f32 = 5.0;
+// 146 is the content area's height (`CONTENT` in app.rs).
+const _: () = assert!(ROW_Y + ROW_H * ROWS <= 146.0, "the Settings rows must fit the panel");
 const LABEL_W: f32 = 96.0;
-const SWATCH: f32 = 26.0;
-const SWATCH_PITCH: f32 = 36.0;
+const SWATCH: f32 = 24.0;
+const SWATCH_PITCH: f32 = 34.0;
 /// Presets, then the custom-colour swatch.
 const SWATCHES: usize = PRESETS.len() + 1;
 /// Room kept at the slider's ends for its knob.
 const KNOB_R: f32 = 8.0;
-const CHIP: (f32, f32) = (76.0, 26.0);
+const CHIP: (f32, f32) = (76.0, 24.0);
 /// Wide enough for "Ctrl+Alt+Shift+PageDown".
 const SHORTCUT_W: f32 = 168.0;
-/// Amber, for the shortcut-conflict note.
-const WARN: Rgb = Rgb(255, 176, 92);
+/// The weather place field.
+const PLACE_W: f32 = 200.0;
+/// Longest place, in chars.
+pub const PLACE_MAX: usize = 60;
 
 /// What a click on the panel landed on.
 pub enum Hit {
@@ -66,6 +73,15 @@ pub enum Hit {
     Center,
     /// The Shortcut chip: start recording a new shortcut.
     Shortcut,
+    /// The weather place field: start typing a city or ZIP.
+    Place,
+}
+
+/// What the Weather row shows besides the saved place.
+pub struct PlaceRow<'a> {
+    /// The field being typed in, and whether its caret is showing.
+    pub editing: Option<(&'a TextField, bool)>,
+    pub status: Status,
 }
 
 /// What the Shortcut row shows besides the saved shortcut.
@@ -105,6 +121,17 @@ fn shortcut_chip() -> Rect {
     Rect::new(LABEL_W, row_centre(3) - CHIP.1 / 2.0, SHORTCUT_W, CHIP.1)
 }
 
+/// The weather place field.
+fn place_field() -> Rect {
+    Rect::new(LABEL_W, row_centre(4) - CHIP.1 / 2.0, PLACE_W, CHIP.1)
+}
+
+/// Where the place field's text goes, inside its padding.
+pub fn place_text_rect() -> Rect {
+    let f = place_field();
+    Rect::new(f.x + 10.0, f.y, f.w - 20.0, f.h)
+}
+
 /// The opacity the slider gives at content x `x`.
 pub fn opacity_at(x: f32) -> u32 {
     let o = OPACITY_MIN as f32 + slider_at(track(), x) * (100 - OPACITY_MIN) as f32;
@@ -128,14 +155,26 @@ pub fn hit(x: f32, y: f32) -> Option<Hit> {
     if shortcut_chip().contains(x, y) {
         return Some(Hit::Shortcut);
     }
+    if place_field().contains(x, y) {
+        return Some(Hit::Place);
+    }
     center_chip().contains(x, y).then_some(Hit::Center)
 }
 
-pub fn draw(cv: &Canvas, w: f32, settings: &Settings, shortcut: ShortcutRow) {
+pub fn draw(cv: &Canvas, w: f32, settings: &Settings, shortcut: ShortcutRow, place: PlaceRow) {
     let label = |i: usize, text: &str| {
-        cv.text(text, Font::Label, Ink::Dim, Rect::new(0.0, row_centre(i) - 12.0, LABEL_W, 24.0), Align::Left);
+        cv.caps(text, Font::Caption, Ink::Dim, Rect::new(0.0, row_centre(i) - 12.0, LABEL_W, 24.0), Align::Left);
     };
     let after = |r: Rect| Rect::new(r.right() + 14.0, r.y + r.h / 2.0 - 12.0, w - r.right() - 14.0, 24.0);
+    // A chip: glass at rest, brighter under the cursor, lit while it's taking input.
+    let chip_bg = |r: Rect, enabled: bool, lit: bool| {
+        cv.fill(r, space::CONTROL_RADIUS, Ink::Track);
+        cv.fill_a(r, space::CONTROL_RADIUS, Ink::Hover, cv.hover_if(r, enabled && !lit));
+        if lit {
+            cv.fill(r, space::CONTROL_RADIUS, Ink::Lit);
+            cv.outline(r, space::CONTROL_RADIUS, Ink::LitEdge, 1.0);
+        }
+    };
 
     // Colour: presets, then a custom swatch showing the custom colour once one is chosen.
     label(0, "Color");
@@ -155,9 +194,10 @@ pub fn draw(cv: &Canvas, w: f32, settings: &Settings, shortcut: ShortcutRow) {
         // Dark swatches would vanish into the body without an edge.
         cv.circle(cx, cy, radius - 0.5, Ink::Edge, Some(1.0));
         if selected {
-            cv.circle(cx, cy, radius + 3.5, Ink::Text, Some(2.0));
-        } else if cv.hovered(r) {
-            cv.circle(cx, cy, radius + 3.5, Ink::Dim, Some(1.0));
+            cv.circle(cx, cy, radius + 3.5, Ink::Accent, Some(1.5));
+            cv.halo(cx, cy, radius + 3.5, Ink::Accent, 0.6);
+        } else {
+            cv.circle_a(cx, cy, radius + 3.5, Ink::Dim, Some(1.0), cv.hover(r));
         }
     }
     let name = preset.map_or("Custom", |p| PRESETS[p].0);
@@ -175,28 +215,53 @@ pub fn draw(cv: &Canvas, w: f32, settings: &Settings, shortcut: ShortcutRow) {
     label(2, "Position");
     let chip = center_chip();
     let centred = settings.position == 0.5;
-    let fill = if !centred && cv.hovered(chip) { Ink::Hover } else { Ink::Track };
-    cv.fill(chip, CHIP.1 / 2.0, fill);
-    cv.text("Center", Font::Small, if centred { Ink::Dim } else { Ink::Text }, chip, Align::Center);
+    chip_bg(chip, !centred, false);
+    cv.text("Center", Font::Label, if centred { Ink::Dim } else { Ink::Text }, chip, Align::Center);
     let hint = "Or drag the empty space beside the tabs to slide the notch";
     cv.text(hint, Font::Small, Ink::Dim, after(chip), Align::Left);
 
-    // Shortcut: click the chip, then press the new combination.
+    // Shortcut: click the chip, then press the new combination. While it listens, it's lit.
     label(3, "Shortcut");
     let chip = shortcut_chip();
-    let fill = if shortcut.recording || cv.hovered(chip) { Ink::Hover } else { Ink::Track };
-    cv.fill(chip, CHIP.1 / 2.0, fill);
+    chip_bg(chip, true, shortcut.recording);
     let saved = settings.hotkey.map(|h| h.to_string());
     let (text, ink, note, note_ink) = match (&saved, shortcut) {
         (_, ShortcutRow { recording: true, .. }) => {
             ("Press a shortcut…", Ink::Accent, "Esc cancels · Backspace clears", Ink::Dim)
         }
-        (Some(s), ShortcutRow { taken: true, .. }) => (s.as_str(), Ink::Text, "Taken by another app", Ink::Rgb(WARN)),
+        (Some(s), ShortcutRow { taken: true, .. }) => {
+            (s.as_str(), Ink::Text, "Taken by another app", Ink::Rgb(color::WARN))
+        }
         (Some(s), _) => (s.as_str(), Ink::Text, "Opens app search from anywhere", Ink::Dim),
         (None, _) => ("None", Ink::Dim, "Click to set a shortcut", Ink::Dim),
     };
-    cv.text(text, Font::Small, ink, chip, Align::Center);
+    cv.text(text, Font::Label, ink, chip, Align::Center);
     cv.text(note, Font::Small, note_ink, after(chip), Align::Left);
+
+    // Weather: click the field and type a city or ZIP; Enter looks it up.
+    label(4, "Weather");
+    let field = place_field();
+    chip_bg(field, true, place.editing.is_some());
+    let placeholder = "City or ZIP code";
+    let query = settings.place.as_ref().map(|(q, _)| q.as_str());
+    match place.editing {
+        Some((typed, caret_on)) => text::draw(cv, typed, place_text_rect(), Font::Body, placeholder, caret_on),
+        None => {
+            let (shown, ink) = query.map_or((placeholder, Ink::Dim), |q| (q, Ink::Text));
+            cv.text(shown, Font::Body, ink, place_text_rect(), Align::Left);
+        }
+    }
+    let found = settings.place.as_ref().and_then(|(_, found)| found.as_ref());
+    let (note, note_ink) = match (place.editing, found, place.status) {
+        (Some(_), _, _) => ("Enter saves · Esc cancels · empty turns it off".to_owned(), Ink::Dim),
+        (None, Some(p), Status::Offline) => (format!("{} · can't reach the weather service", p.name), Ink::Dim),
+        (None, Some(p), _) => (p.name.clone(), Ink::Text),
+        (None, None, _) if query.is_none() => ("Shows the temperature and sky on the Time tab".to_owned(), Ink::Dim),
+        (None, None, Status::NotFound) => ("No place found by that name".to_owned(), Ink::Rgb(color::WARN)),
+        (None, None, Status::Offline) => ("Can't reach the weather service".to_owned(), Ink::Dim),
+        (None, None, _) => ("Looking it up…".to_owned(), Ink::Dim),
+    };
+    cv.text(&note, Font::Small, note_ink, after(field), Align::Left);
 }
 
 fn colorref(c: u32) -> COLORREF {
@@ -292,17 +357,18 @@ pub fn pick_color(owner: HWND, initial: u32, picker: Picker) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hit, LABEL_W, OPACITY_MIN, center_chip, hit, opacity_at, shortcut_chip, swatch, track, wheel_opacity};
+    use super::{Hit, LABEL_W, OPACITY_MIN, center_chip, hit, opacity_at, place_field, shortcut_chip, swatch, track, wheel_opacity};
 
     fn centre(r: crate::gfx::Rect) -> (f32, f32) {
         (r.x + r.w / 2.0, r.y + r.h / 2.0)
     }
 
     #[test]
-    fn four_rows_fit_the_content_area() {
-        // The rows themselves are checked at compile time, beside ROW_H. 176 is the content
+    fn five_rows_fit_the_content_area() {
+        // The rows themselves are checked at compile time, beside ROW_H. 146 is the content
         // area's height (`CONTENT` in app.rs).
-        assert!(shortcut_chip().y + shortcut_chip().h <= 176.0);
+        assert!(place_field().y + place_field().h <= 146.0);
+        assert!(shortcut_chip().y + shortcut_chip().h < place_field().y);
     }
 
     #[test]
@@ -315,7 +381,9 @@ mod tests {
         assert!(matches!(at(track()), Some(Hit::Opacity)));
         assert!(matches!(at(center_chip()), Some(Hit::Center)));
         assert!(matches!(at(shortcut_chip()), Some(Hit::Shortcut)));
-        assert!(hit(LABEL_W + 10.0, 133.0).is_none(), "between the Position and Shortcut chips");
+        assert!(matches!(at(place_field()), Some(Hit::Place)));
+        let between = (center_chip().y + center_chip().h + shortcut_chip().y) / 2.0;
+        assert!(hit(LABEL_W + 10.0, between).is_none(), "between the Position and Shortcut chips");
     }
 
     #[test]

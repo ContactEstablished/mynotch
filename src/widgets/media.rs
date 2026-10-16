@@ -39,16 +39,17 @@ struct PanelLayout {
 }
 
 fn panel_layout(w: f32, h: f32) -> PanelLayout {
-    let art = Rect::new(0.0, (h - 160.0) / 2.0, 160.0, 160.0);
-    let text_x = art.right() + 24.0;
+    let side = h.min(140.0);
+    let art = Rect::new(0.0, (h - side) / 2.0, side, side);
+    let text_x = art.right() + 22.0;
     let tw = w - text_x;
-    let bar = Rect::new(text_x, 96.0, tw, 4.0);
-    let [prev, play, next] = button_row(text_x + tw / 2.0, 148.0, [36.0, 44.0, 36.0], 16.0);
+    let bar = Rect::new(text_x, 82.0, tw, 4.0);
+    let [prev, play, next] = button_row(text_x + tw / 2.0, h - 22.0, [32.0, 40.0, 32.0], 16.0);
     PanelLayout {
         art,
         text_x,
         bar,
-        seek: Rect::new(text_x, 86.0, tw, 24.0),
+        seek: Rect::new(text_x, bar.y - 10.0, tw, 24.0),
         buttons: [(Command::Previous, prev), (Command::TogglePlayPause, play), (Command::Next, next)],
     }
 }
@@ -60,10 +61,10 @@ struct CardLayout {
 }
 
 fn card_layout(w: f32, h: f32) -> CardLayout {
-    let [prev, play, next] = button_row(w / 2.0, h - 18.0, [32.0, 36.0, 32.0], 14.0);
+    let [prev, play, next] = button_row(w / 2.0, h - 17.0, [28.0, 34.0, 28.0], 14.0);
     CardLayout {
-        art: Rect::new(0.0, 0.0, 64.0, 64.0),
-        bar: Rect::new(0.0, 80.0, w, 3.0),
+        art: Rect::new(0.0, 0.0, 60.0, 60.0),
+        bar: Rect::new(0.0, 70.0, w, 3.0),
         buttons: [(Command::Previous, prev), (Command::TogglePlayPause, play), (Command::Next, next)],
     }
 }
@@ -72,7 +73,7 @@ fn draw_art(cv: &Canvas, now: Option<&NowPlaying>, r: Rect, radius: f32, font: F
     match now.and_then(|n| n.art.as_ref()) {
         Some(art) => cv.image(art, r, radius),
         None => {
-            cv.fill(r, radius, Ink::Track);
+            cv.card(r, radius, 0.0);
             cv.text(glyph::MUSIC, font, Ink::Dim, r, Align::Center);
         }
     }
@@ -165,7 +166,9 @@ impl Widget for MediaWidget {
         } else {
             format!("♪  {} — {}", now.title, now.artist)
         };
-        Some(Compact { priority: 10, text, live: true })
+        let progress = (!now.duration.is_zero())
+            .then(|| now.position_now().as_secs_f32() / now.duration.as_secs_f32());
+        Some(Compact { priority: 10, text, live: true, progress })
     }
 
     fn draw(&self, cv: &Canvas, w: f32, h: f32) {
@@ -173,15 +176,15 @@ impl Widget for MediaWidget {
         draw_art(cv, self.now.as_ref(), l.art, 14.0, Font::IconLarge);
         let tw = w - l.text_x;
         let Some(now) = &self.now else {
-            cv.text("Nothing playing", Font::Heading, Ink::Dim, Rect::new(l.text_x, 56.0, tw, 28.0), Align::Left);
-            cv.text("Play something in any app", Font::Body, Ink::Dim, Rect::new(l.text_x, 86.0, tw, 20.0), Align::Left);
+            cv.text("Nothing playing", Font::Heading, Ink::Dim, Rect::new(l.text_x, 44.0, tw, 28.0), Align::Left);
+            cv.text("Play something in any app", Font::Body, Ink::Dim, Rect::new(l.text_x, 72.0, tw, 20.0), Align::Left);
             return;
         };
 
         let title = if now.title.is_empty() { "Unknown title" } else { &now.title };
-        cv.text(title, Font::Heading, Ink::Text, Rect::new(l.text_x, 10.0, tw, 28.0), Align::Left);
-        cv.text(&now.artist, Font::Body, Ink::Dim, Rect::new(l.text_x, 40.0, tw, 20.0), Align::Left);
-        cv.text(&now.app, Font::Small, Ink::Dim, Rect::new(l.text_x, 60.0, tw, 18.0), Align::Left);
+        cv.text(title, Font::Heading, Ink::Text, Rect::new(l.text_x, 4.0, tw, 28.0), Align::Left);
+        cv.text(&now.artist, Font::Body, Ink::Dim, Rect::new(l.text_x, 32.0, tw, 20.0), Align::Left);
+        cv.caps(&now.app, Font::Caption, Ink::Dim, Rect::new(l.text_x, 52.0, tw, 18.0), Align::Left);
 
         if !now.duration.is_zero() {
             draw_progress(cv, now, l.bar);
@@ -189,7 +192,7 @@ impl Widget for MediaWidget {
                 let done = now.position_now().as_secs_f32() / now.duration.as_secs_f32();
                 cv.circle(l.bar.x + l.bar.w * done, l.bar.y + l.bar.h / 2.0, 6.0, Ink::Text, None);
             }
-            let times = Rect::new(l.text_x, 104.0, tw, 18.0);
+            let times = Rect::new(l.text_x, l.bar.y + 8.0, tw, 16.0);
             cv.text(&clock(now.position_now()), Font::Small, Ink::Dim, times, Align::Left);
             cv.text(&clock(now.duration), Font::Small, Ink::Dim, times, Align::Right);
         }
@@ -214,9 +217,9 @@ impl Widget for MediaWidget {
             return;
         };
         let title = if now.title.is_empty() { "Unknown title" } else { &now.title };
-        cv.text(title, Font::Title, Ink::Text, Rect::new(tx, 4.0, tw, 22.0), Align::Left);
-        cv.text(&now.artist, Font::Small, Ink::Dim, Rect::new(tx, 26.0, tw, 18.0), Align::Left);
-        cv.text(&now.app, Font::Small, Ink::Dim, Rect::new(tx, 44.0, tw, 16.0), Align::Left);
+        cv.text(title, Font::Title, Ink::Text, Rect::new(tx, 2.0, tw, 22.0), Align::Left);
+        cv.text(&now.artist, Font::Small, Ink::Dim, Rect::new(tx, 24.0, tw, 18.0), Align::Left);
+        cv.caps(&now.app, Font::Caption, Ink::Dim, Rect::new(tx, 42.0, tw, 16.0), Align::Left);
         draw_progress(cv, now, l.bar);
         draw_buttons(cv, now, &l.buttons, false);
     }

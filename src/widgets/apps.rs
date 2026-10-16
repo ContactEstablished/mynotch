@@ -12,7 +12,7 @@ use crate::gfx::{Align, Canvas, Font, Image, Ink, Rect, Rgb, glyph};
 use crate::settings::Settings;
 
 const TILE_W: f32 = 84.0;
-const TILE_H: f32 = 88.0;
+const TILE_H: f32 = 72.0;
 const ICON: f32 = 40.0;
 const BADGE_R: f32 = 9.0;
 /// How many suggested apps get pinned on first run.
@@ -25,11 +25,11 @@ const BADGE: Rgb = Rgb(58, 58, 68);
 const ON_ACCENT: Rgb = Rgb(12, 12, 18);
 
 fn icon_rect(tile: Rect) -> Rect {
-    Rect::new(tile.x + (tile.w - ICON) / 2.0, tile.y + 10.0, ICON, ICON)
+    Rect::new(tile.x + (tile.w - ICON) / 2.0, tile.y + 6.0, ICON, ICON)
 }
 
 fn label_rect(tile: Rect) -> Rect {
-    Rect::new(tile.x + 4.0, tile.y + 58.0, tile.w - 8.0, 18.0)
+    Rect::new(tile.x + 4.0, tile.y + 49.0, tile.w - 8.0, 18.0)
 }
 
 /// A badge on the top-right corner of a tile's icon, with a generous hit area.
@@ -227,9 +227,7 @@ impl AppsWidget {
     }
 
     fn draw_tile(&self, cv: &Canvas, tile: Tile, r: Rect, hovered: bool) {
-        if hovered {
-            cv.fill(r, 12.0, Ink::Track);
-        }
+        cv.fill_a(r, 12.0, Ink::Track, cv.hover_if(r, hovered));
         let icon = icon_rect(r);
         let label = label_rect(r);
         match tile {
@@ -512,11 +510,11 @@ impl Widget for AppsWidget {
             return;
         }
         for (pos, r) in Self::result_layout(s, w, h) {
-            if pos == s.hit {
-                cv.fill(r, 12.0, Ink::Hover);
-            } else if cv.hovered(r) {
-                cv.fill(r, 12.0, Ink::Track);
-            }
+            // The highlighted result is lit, like the focused control it is.
+            let lit = cv.ease(crate::motion::key(("result", pos)), f32::from(u8::from(pos == s.hit)), crate::theme::motion::STATE);
+            cv.fill_a(r, 12.0, Ink::Track, cv.hover_if(r, pos != s.hit));
+            cv.fill_a(r, 12.0, Ink::Lit, lit);
+            cv.outline(r, 12.0, Ink::LitEdge, lit);
             self.draw_face(cv, &self.apps[s.results[pos]], r);
         }
         Self::draw_scrollbar(cv, w, h, s.scroll, Self::result_max_scroll(s, w, h));
