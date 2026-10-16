@@ -429,11 +429,11 @@ pub enum Font {
     IconMedium,
     /// 24px icon glyphs.
     IconLarge,
-    /// Rajdhani 500, 48px: the focus timer.
-    Focus,
-    /// Rajdhani 500, 40px: the clock.
+    /// Rajdhani 500, 32px: the timer.
+    Timer,
+    /// Rajdhani 500, 48px: the clock.
     Clock,
-    /// Rajdhani 500, 32px: the stopwatch, and the focus time on Home.
+    /// Rajdhani 500, 32px: the stopwatch, and the timer on Home.
     Stopwatch,
     /// Rajdhani 500, 20px: seconds and tenths beside the big numbers.
     Fraction,
@@ -462,7 +462,7 @@ impl Font {
         Font::IconCaption,
         Font::IconMedium,
         Font::IconLarge,
-        Font::Focus,
+        Font::Timer,
         Font::Clock,
         Font::Stopwatch,
         Font::Fraction,
@@ -484,7 +484,7 @@ impl Font {
             Font::IconCaption => (Icons, 13.0, normal),
             Font::IconMedium => (Icons, 20.0, normal),
             Font::IconLarge => (Icons, 24.0, normal),
-            Font::Focus => (Numerals, type_size::FOCUS, DWRITE_FONT_WEIGHT_MEDIUM),
+            Font::Timer => (Numerals, type_size::TIMER, DWRITE_FONT_WEIGHT_MEDIUM),
             Font::Clock => (Numerals, type_size::CLOCK, DWRITE_FONT_WEIGHT_MEDIUM),
             Font::Stopwatch => (Numerals, type_size::STOPWATCH, DWRITE_FONT_WEIGHT_MEDIUM),
             Font::Fraction => (Numerals, type_size::FRACTION, DWRITE_FONT_WEIGHT_MEDIUM),
@@ -1184,8 +1184,10 @@ impl<'a> Canvas<'a> {
     }
 
     /// A comet of light running clockwise around the edge of a rounded rect: its bright head
-    /// is `head` (0..1) of the way round, its tail fading behind. Shows something is running.
-    pub fn runner(&self, r: Rect, radius: f32, head: f32, ink: Ink, a: f32) {
+    /// is `head` (0..1) of the way round, its tail fading behind, `stretch` times its usual
+    /// length. Shows something is running.
+    #[allow(clippy::too_many_arguments)]
+    pub fn runner(&self, r: Rect, radius: f32, head: f32, ink: Ink, a: f32, stretch: f32) {
         if a <= 0.0 {
             return;
         }
@@ -1198,7 +1200,7 @@ impl<'a> Canvas<'a> {
         // Overlapping dashes that all end at the head: long and faint, short and bright, and
         // a wide soft glow.
         for (length, width, alpha) in [(0.26, 1.2, 0.25), (0.14, 1.4, 0.55), (0.05, 1.8, 1.0), (0.12, 5.0, 0.12)] {
-            let (len, width) = (perimeter * length, width * s);
+            let (len, width) = ((perimeter * length * stretch).clamp(width * s, perimeter * 0.6), width * s);
             let start = (head.rem_euclid(1.0) * perimeter - len).rem_euclid(perimeter);
             // Dashes are measured in stroke widths: one dash, then a gap for the rest of the way.
             let props = D2D1_STROKE_STYLE_PROPERTIES {

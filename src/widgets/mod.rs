@@ -73,14 +73,18 @@ fn pulsing(since: Option<Instant>) -> bool {
     since.is_some_and(|s| !motion::reduced() && s.elapsed() < timing::PULSE)
 }
 
-/// How long the light takes to run once round a running card.
-const LAP: f32 = 4.0;
+/// How long the light takes to run once round a running card, in seconds.
+const LAP: f32 = 1.0;
 
-/// The cue that a card's timer is running: a light running round its edge. (With
-/// animations off, the card's own lit edge says it instead.)
+/// The cue that a card's timer is running: a light running round its edge. Each lap eases
+/// in and out (slow away from the start, fast round the far side, slow into the finish),
+/// and its tail stretches with its speed, so it moves elastically. (With animations off,
+/// the card's own lit edge says it instead.)
 pub fn running_edge(cv: &Canvas, card: Rect, ink: Ink) {
     if !motion::reduced() {
-        cv.runner(card, space::CARD_RADIUS, motion::cycle(LAP), ink, 1.0);
+        let t = motion::cycle(LAP) * std::f32::consts::PI;
+        let (head, speed) = (0.5 - 0.5 * t.cos(), t.sin());
+        cv.runner(card, space::CARD_RADIUS, head, ink, 1.0, 0.35 + 1.15 * speed);
     }
 }
 
@@ -276,7 +280,7 @@ pub trait Widget {
     }
 }
 
-pub use clock::now_short;
+pub use clock::{now_short, weather_icon};
 
 /// Every widget, in tab order. The Time tab shows `weather`.
 pub fn all(weather: &Rc<Weather>) -> Vec<Box<dyn Widget>> {

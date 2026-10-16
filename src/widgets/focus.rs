@@ -26,8 +26,8 @@ const RING_R: f32 = 29.0;
 const RING_W: f32 = 2.5;
 const RING_IN: f32 = 34.0;
 const SMALL_BUTTON: f32 = 22.0;
-/// Where the big numbers sit (their baseline), on the card and on Home.
-const BASELINE: f32 = 54.0;
+/// Where the time sits (its baseline), on the card and on Home.
+const BASELINE: f32 = 46.0;
 const CARD_BASELINE: f32 = 47.0;
 /// How long the glow at the ring's moving end takes to swell and fade.
 const BREATH: f32 = 2.4;
@@ -189,11 +189,9 @@ impl Focus {
         self.was_pulsing.set(pulsing(self.started));
         super::time::header(cv, None, "Timer", Ink::Accent, w);
 
-        // The time, big; past an hour it steps down a size to stay clear of the ring.
         let time = clock(self.remaining(now));
-        let font = if time.len() > 5 { Font::Clock } else { Font::Focus };
-        cv.numerals(&[(time.as_str(), font, Ink::Text)], 0.0, BASELINE, Align::Left);
-        let status = Rect::new(0.0, 57.0, w - RING_IN - RING_R - 6.0, 18.0);
+        cv.numerals(&[(time.as_str(), Font::Timer, Ink::Text)], 0.0, BASELINE, Align::Left);
+        let status = Rect::new(0.0, 51.0, w - RING_IN - RING_R - 6.0, 18.0);
         cv.text(&self.status(now), Font::Small, Ink::Dim, status, Align::Left);
 
         for (control, r) in controls(w) {
@@ -268,7 +266,7 @@ impl Focus {
         let now = Instant::now();
         self.was_pulsing.set(pulsing(self.started));
         super::time::header(cv, None, "Timer", Ink::Accent, w);
-        cv.numerals(&[(clock(self.remaining(now)).as_str(), Font::Stopwatch, Ink::Text)], 0.0, CARD_BASELINE, Align::Left);
+        cv.numerals(&[(clock(self.remaining(now)).as_str(), Font::Timer, Ink::Text)], 0.0, CARD_BASELINE, Align::Left);
         cv.text(&self.status(now), Font::Small, Ink::Dim, Rect::new(0.0, 51.0, w, 18.0), Align::Left);
         // A thin bar of the time left, its end breathing while it runs.
         let bar = Rect::new(0.0, 76.0, w, 2.0);
@@ -375,7 +373,7 @@ mod tests {
         let [(_, reset), (_, ring)] = controls(w);
         let last_chip = chips().last().map(|(_, r)| r).unwrap();
         assert!(last_chip.right() < reset.x, "chips stop short of reset");
-        assert!(ring.x > 121.0 + 6.0, "the ring clears the time, even past an hour");
+        assert!(ring.x > 100.0 + 6.0, "the ring clears the time, even past an hour (\"2:30:00\")");
         assert!(ring.right() <= w && ring.y >= 0.0, "inside the card");
         assert!(reset.y > ring.y + RING_R * 2.0 + 5.0, "reset sits under the ring and its glow");
         let t = track(w, h);

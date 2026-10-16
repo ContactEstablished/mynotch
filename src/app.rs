@@ -60,7 +60,7 @@ const CMD_AUTOSTART: usize = 3;
 const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
-const COLLAPSED: (f32, f32) = (250.0, 32.0);
+const COLLAPSED: (f32, f32) = (270.0, 32.0);
 const EXPANDED: (f32, f32) = (720.0, 210.0);
 const RADIUS: f32 = space::BODY_RADIUS;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
@@ -1252,9 +1252,12 @@ impl App {
             self.t = if motion::reduced() { target } else { approach(self.t, target, ANIMATION_STEP) };
             self.dirty = true;
         }
-        // A running timer or stopwatch on screen moves: about 30 frames a second.
+        // Something moving on screen gets its frames: every tick for the light running round a
+        // card, every other one for the rail's breathing dot.
         self.frame = self.frame.wrapping_add(1);
-        if self.frame.is_multiple_of(2) && self.animating() {
+        if let Some(every) = self.animation()
+            && self.frame.is_multiple_of(every)
+        {
             self.dirty = true;
         }
         if self.dirty {
@@ -1262,21 +1265,24 @@ impl App {
         }
     }
 
-    /// Whether something on screen is animating by itself: a running timer or stopwatch on
-    /// the open tab (or Home's timer card), or the rail's live dot while one runs.
-    fn animating(&self) -> bool {
+    /// Whether something on screen is animating by itself, as how often to draw it (every
+    /// `n`th frame tick): a running timer or stopwatch on the open tab (or Home's timer card)
+    /// every tick, about 60 fps, since its light moves fast; the rail's live dot while one
+    /// runs every other tick.
+    fn animation(&self) -> Option<u32> {
         if motion::reduced() || self.hidden {
-            return false;
+            return None;
         }
         if self.t < 0.5 {
-            return self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating());
+            return self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating()).then_some(2);
         }
-        match self.active {
+        let moving = match self.active {
             _ if self.search.is_some() => false,
             HOME => self.widgets.iter().any(|w| w.card_weight().is_some() && w.card_animating()),
             t if t == settings_tab(&self.widgets) => false,
             t => self.widgets[t - 1].animating(),
-        }
+        };
+        moving.then_some(1)
     }
 
     /// Left button down at window-relative physical coordinates.
@@ -1610,9 +1616,9 @@ impl App {
         })
     }
 
-    /// The collapsed notch: the time and temperature on the left, the top-priority widget's
-    /// readout (a running timer, the song playing, CPU and RAM) on the right, and a hairline of
-    /// progress along the bottom while a timer runs or a song plays.
+    /// The collapsed notch: the time, the sky and the temperature on the left, the
+    /// top-priority widget's readout (a running timer, the song playing, CPU and RAM) on the
+    /// right, and a hairline of progress along the bottom while a timer runs or a song plays.
     fn draw_rail(&self, cv: &Canvas, w: f32, h: f32) {
         let baseline = h / 2.0 + 5.0;
         let (time, marker) = widgets::now_short();
@@ -1622,10 +1628,11 @@ impl App {
             cv.caps(&marker, Font::Caption, Ink::Dim, r, Align::Left);
             x += 3.0 + cv.measure(&marker, Font::Caption) + 2.0;
         }
-        // The temperature, once there's weather; a step quieter than the time.
+        // The sky and the temperature, once there's weather; a step quieter than the time.
         if let Some(report) = self.weather.report() {
+            widgets::weather_icon(cv, (x + 15.0, h / 2.0), 14.0, &report);
             let degrees = format!("{:.0}°", report.temperature.round() + 0.0);
-            x += 8.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 8.0, baseline, Align::Left);
+            x += 25.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 25.0, baseline, Align::Left);
         }
         let Some((i, compact)) = self.compact() else { return };
         cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);

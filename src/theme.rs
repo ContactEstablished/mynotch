@@ -52,12 +52,13 @@ pub mod alpha {
 /// Type sizes in logical px. Big numbers are Rajdhani 500; everything else is Segoe UI
 /// Variable (or Segoe UI).
 pub mod text {
-    pub const FOCUS: f32 = 48.0;
-    pub const CLOCK: f32 = 40.0;
+    /// The clock is the biggest number on the Time tab.
+    pub const CLOCK: f32 = 48.0;
+    pub const TIMER: f32 = 32.0;
     pub const STOPWATCH: f32 = 32.0;
     /// Seconds and tenths beside the big numbers.
     pub const FRACTION: f32 = 20.0;
-    /// Small numerals: the collapsed rail and the session counter.
+    /// Small numerals: the collapsed rail.
     pub const NUMERAL: f32 = 15.0;
     /// Buttons, chips and the active tab's name.
     pub const CONTROL: f32 = 12.5;

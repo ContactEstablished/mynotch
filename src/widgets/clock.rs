@@ -40,8 +40,6 @@ pub struct Clock {
     weekday: String,
     /// "October 15".
     date: String,
-    /// Minutes since local midnight: day and night by the clock when there are no sun times.
-    minutes: u32,
 }
 
 impl Clock {
@@ -54,7 +52,6 @@ impl Clock {
             marker: String::new(),
             weekday: String::new(),
             date: String::new(),
-            minutes: 0,
         }
     }
 
@@ -76,23 +73,13 @@ impl Clock {
         let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_SMONTHDAY, Some(&mut picture)) };
         let picture = if n > 1 { PCWSTR(picture.as_ptr()) } else { w!("MMMM d") };
         self.date = format_date(&st, picture);
-        self.minutes = u32::from(st.wHour) * 60 + u32::from(st.wMinute);
         true
-    }
-
-    /// Day or night, and how far through it: from the place's sunrises and sunsets when the
-    /// weather has them, else by the clock (day from 6:00 to 18:00).
-    fn daylight(&self, report: Option<&weather::Report>, now: i64) -> (bool, f32) {
-        report.and_then(|r| weather::daylight(&r.sun, now)).unwrap_or_else(|| {
-            let from_six = (self.minutes + 24 * 60 - 6 * 60) % (24 * 60);
-            (from_six < 12 * 60, (from_six % (12 * 60)) as f32 / (12.0 * 60.0))
-        })
     }
 
     pub fn draw(&self, cv: &Canvas, w: f32, _h: f32) {
         let now = weather::unix_now();
         let report = self.weather.report();
-        let (day, through) = self.daylight(report.as_ref(), now);
+        let (day, through) = daylight(report.as_ref(), now);
         let (age, south) = (weather::moon_age(now), report.as_ref().is_some_and(|r| r.south));
 
         // Heading: the sun or the moon, then the label; the weather on the right.
@@ -109,14 +96,22 @@ impl Clock {
             }
         }
 
-        let baseline = 56.0;
+        // The time, big and centred: hours and minutes, smaller seconds, then AM/PM.
+        let baseline = 58.0;
         let runs = [(self.time.as_str(), Font::Clock, Ink::Text), (self.seconds.as_str(), Font::Fraction, Ink::Dim)];
-        let width = cv.numerals(&runs, 0.0, baseline, Align::Left);
+        let marker_w = if self.marker.is_empty() {
+            0.0
+        } else {
+            let tracking = self.marker.chars().count() as f32 * crate::theme::text::TRACKING;
+            MARKER_GAP + cv.measure(&self.marker, Font::Caption) + tracking
+        };
+        let x = ((w - cv.numerals_width(&runs) - marker_w) / 2.0).max(0.0);
+        let width = cv.numerals(&runs, x, baseline, Align::Left);
         if !self.marker.is_empty() {
-            let marker = Rect::new(width + MARKER_GAP, baseline - 13.0, w - width - MARKER_GAP, 14.0);
+            let marker = Rect::new(x + width + MARKER_GAP, baseline - 13.0, marker_w + 4.0, 14.0);
             cv.caps(&self.marker, Font::Caption, Ink::Dim, marker, Align::Left);
         }
-        let row = Rect::new(0.0, 62.0, w, 20.0);
+        let row = Rect::new(0.0, 64.0, w, 20.0);
         cv.text(&self.weekday, Font::Label, Ink::Text, row, Align::Left);
         let weekday_w = cv.measure(&self.weekday, Font::Label) + 8.0;
         cv.text(&self.date, Font::Small, Ink::Dim, Rect { x: weekday_w, w: w - weekday_w, ..row }, Align::Right);
@@ -130,17 +125,36 @@ impl Clock {
             (None, Status::Offline) => "Weather unavailable".to_owned(),
             (None, _) => "Getting the weather…".to_owned(),
         };
-        cv.text(&words, Font::Small, Ink::Dim, Rect::new(0.0, 82.0, w, 18.0), Align::Left);
+        cv.text(&words, Font::Small, Ink::Dim, Rect::new(0.0, 84.0, w, 18.0), Align::Left);
 
         // How far through the day (sun gold) or the night (moon violet): a hairline with a
         // lit stretch ending in a dot.
-        let (y, ink) = (108.0, if day { Ink::Rgb(color::SUN) } else { Ink::Violet });
+        let (y, ink) = (110.0, if day { Ink::Rgb(color::SUN) } else { Ink::Violet });
         cv.line((0.0, y), (w, y), Ink::Line);
         let x = (w * through).max(2.0);
         cv.fill_a(Rect::new(0.0, y - 0.75, x, 1.5), 0.75, ink, 0.85);
         cv.halo(x, y, 2.0, ink, 0.5);
         cv.circle(x, y, 2.0, ink, None);
     }
+}
+
+/// Day or night, and how far through it: from the place's sunrises and sunsets when the
+/// weather has them, else by the clock (day from 6:00 to 18:00).
+fn daylight(report: Option<&weather::Report>, now: i64) -> (bool, f32) {
+    report.and_then(|r| weather::daylight(&r.sun, now)).unwrap_or_else(|| {
+        let st = unsafe { GetLocalTime() };
+        let minutes = u32::from(st.wHour) * 60 + u32::from(st.wMinute);
+        let from_six = (minutes + 24 * 60 - 6 * 60) % (24 * 60);
+        (from_six < 12 * 60, (from_six % (12 * 60)) as f32 / (12.0 * 60.0))
+    })
+}
+
+/// The weather icon for `report`, `size` px across, centred on `at`: for the collapsed rail,
+/// where a clear sky shows the sun or the moon in its phase.
+pub fn weather_icon(cv: &Canvas, at: (f32, f32), size: f32, report: &weather::Report) {
+    let now = weather::unix_now();
+    let (day, _) = daylight(Some(report), now);
+    sky::weather(cv, at, size, report.sky, report.windy, day, weather::moon_age(now), report.south);
 }
 
 /// The time to the minute, as ("9:08", "PM"), or ("21:08", "") with a 24-hour clock.
