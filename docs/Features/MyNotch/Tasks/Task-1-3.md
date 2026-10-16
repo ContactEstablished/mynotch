@@ -1,6 +1,6 @@
 # Task 1-3 — Global shortcut and the Settings recorder
 
-Status: **ready; not started.** Depends on Task 1-2. Paired spec: [ImplementationSpec-1-3](../ImplementationSpecs/ImplementationSpec-1-3.md). Closes Phase 1.
+Status: **done 2026-10-15** in `27e6323`, with the default shortcut changed to Ctrl+Alt+K (see Phase-1-Overview P1-D1). Depends on Task 1-2. Paired spec: [ImplementationSpec-1-3](../ImplementationSpecs/ImplementationSpec-1-3.md). Closes Phase 1.
 
 ## Source Of Truth
 

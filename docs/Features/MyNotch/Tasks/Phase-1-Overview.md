@@ -1,6 +1,6 @@
 # Phase 1 kickoff — Typing, global shortcut, app search
 
-Status: **kicked off 2026-10-15; not started.** All decisions below are resolved. No Phase 1 code has been written. Baseline: `63f6951` ("Add Time tab, notch settings, sliding, and app reordering") on `main`; the only change in the working tree is the untracked `docs/` folder (the roadmap and these documents).
+Status: **done 2026-10-15** (Task 1-1 `4bfe42e`, Task 1-2 `8251ab7`, Task 1-3 `27e6323`). All decisions below are resolved; P1-D1 was amended at the end. The kickoff-time description follows. Baseline: `63f6951` ("Add Time tab, notch settings, sliding, and app reordering") on `main`; the only change in the working tree is the untracked `docs/` folder (the roadmap and these documents).
 
 ## Source Of Truth
 
@@ -33,7 +33,7 @@ What each delivers:
 
 | ID | Decision | Status |
 | --- | --- | --- |
-| P1-D1 (roadmap D6) | Global shortcut default **Ctrl+Alt+Space**. Changed by **recording** it in a new Settings-tab "Shortcut" row: click the chip, press the keys. Backspace or Delete while recording clears it (no shortcut). Esc cancels. A conflict (`RegisterHotKey` fails) is shown on that row ("Taken by another app") and is never fatal. Saved as `hotkey=` in settings.ini; `hotkey=` with an empty value means none. | RESOLVED by user, 2026-10-15 |
+| P1-D1 (roadmap D6) | Global shortcut default **Ctrl+Alt+Space** (amended 2026-10-15 to **Ctrl+Alt+K** by the user: Claude desktop owns Ctrl+Alt+Space on the dev PC). Changed by **recording** it in a new Settings-tab "Shortcut" row: click the chip, press the keys. Backspace or Delete while recording clears it (no shortcut). Esc cancels. A conflict (`RegisterHotKey` fails) is shown on that row ("Taken by another app") and is never fatal. Saved as `hotkey=` in settings.ini; `hotkey=` with an empty value means none. | RESOLVED by user, 2026-10-15 |
 | P1-D2 | Search lives in a **bar in the tab row**. A magnifier button sits at the right end of the empty stretch, carved out of `handle_rect` so the ↔ cursor and slide-drag don't apply to it. Clicking it, or the shortcut, turns the whole stretch into a search field drawn as an outlined tab joining the panel (as the active tab does today); while searching no widget tab is drawn active and the baseline opens under the field. Results fill the content area. The stretch can't be dragged while searching. Phase 4 reuses this bar for quick-add. | RESOLVED by user, 2026-10-15 |
 | P1-D3 | Esc closes search, clears it, and gives focus back to the previous window. | RESOLVED by coordinator, 2026-10-15 (user informed) |
 | P1-D4 | Clicking a tab (any tab, including Home and Settings) while searching closes search, gives focus back, and selects that tab. | RESOLVED by coordinator, 2026-10-15 (user informed) |

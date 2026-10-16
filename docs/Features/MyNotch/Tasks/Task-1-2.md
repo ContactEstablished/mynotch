@@ -1,6 +1,6 @@
 # Task 1-2 — App search results
 
-Status: **ready; not started.** Depends on Task 1-1. Paired spec: [ImplementationSpec-1-2](../ImplementationSpecs/ImplementationSpec-1-2.md).
+Status: **done 2026-10-15** in `8251ab7`. Depends on Task 1-1. Paired spec: [ImplementationSpec-1-2](../ImplementationSpecs/ImplementationSpec-1-2.md).
 
 ## Source Of Truth
 

@@ -1,6 +1,6 @@
 # MyNotch roadmap — typing, Live Status, Signal integration, indicators
 
-Status: **drafted 2026-10-15.** Phase 1 kicked off 2026-10-15 (task docs written; no code yet). Baseline: `63f6951` ("Add Time tab, notch settings, sliding, and app reordering") on `main`.
+Status: **drafted 2026-10-15.** Phase 1 kicked off and **done** 2026-10-15 (`4bfe42e`, `8251ab7`, `27e6323`). Baseline: `63f6951` ("Add Time tab, notch settings, sliding, and app reordering") on `main`.
 
 ## Purpose
 
@@ -73,7 +73,7 @@ All facts verified 2026-10-15. Paths are relative to each repo's root.
 | D3 | Notes live in a new Signal notes table. | RESOLVED (2026-10-15, new table in Signal) | Signal has no notes table; its own planned Notes view can show them. |
 | D4 | Transport: a per-user Windows named pipe whose name derives from Signal's identifier; JSON messages carrying a protocol version; current-user-only access; no TCP port. | PROPOSED — confirm at Phase 3 kickoff | Dev and personal builds can run at once, so names must differ. Satisfies G5. |
 | D5 | Live Status transport: `mynotch status …` runs the same exe, which forwards the message to the running notch and exits. No server, no port. | PROPOSED — confirm at Phase 2 kickoff | Reuses the single-instance exe; nothing new listens. |
-| D6 | Global shortcut: default Ctrl+Alt+Space, changeable, saved in settings.ini. A conflict is reported, not fatal. | RESOLVED (2026-10-15, user: default Ctrl+Alt+Space, changed by recording it in a Settings-tab row; see Phase-1-Overview P1-D1, P1-D13) | Another app may already own the combination. |
+| D6 | Global shortcut: default Ctrl+Alt+Space, changeable, saved in settings.ini. A conflict is reported, not fatal. | RESOLVED (2026-10-15, user: default Ctrl+Alt+Space, changed by recording it in a Settings-tab row; see Phase-1-Overview P1-D1, P1-D13). AMENDED 2026-10-15 (user): default **Ctrl+Alt+K**, because Claude desktop owns Ctrl+Alt+Space on the dev PC. | Another app may already own the combination. |
 | D7 | Which Signal project receives tasks added from the notch. Proposed: a default project chosen in the notch's Settings, with a chip to override it when adding. | OPEN — needed by Phase 4 | Tasks added from the notch need a home in Signal. |
 | D8 | Keeping Signal available: turn on close-to-tray, and possibly add Start with Windows to Signal. | OPEN — needed by Phase 4 | Meetings only show while Signal runs, and closing its window quits it by default. |
 | D9 | Does Phase 3 include a minimal Notes view inside Signal, or do notch-created notes wait for Signal's planned Notes view? | OPEN — decide at Phase 3 kickoff | Without a view, notes made in the notch are invisible inside Signal. |
@@ -96,7 +96,7 @@ All facts verified 2026-10-15. Paths are relative to each repo's root.
 
 | Phase | Repo | Status | Depends on |
 | --- | --- | --- | --- |
-| 1 — Typing, global shortcut, app search | MyNotch | Kicked off 2026-10-15 — Tasks 1-1…1-3 ready | — |
+| 1 — Typing, global shortcut, app search | MyNotch | Done 2026-10-15 — `4bfe42e`, `8251ab7`, `27e6323` | — |
 | 2 — Live Status | MyNotch | Provisional | — |
 | 3 — Signal local API v1 | Signal | Provisional | — (can run in parallel with Phases 1–2) |
 | 4 — Agenda, Tasks and Notes in the notch | MyNotch | Provisional | Phases 1 and 3 |
@@ -104,7 +104,7 @@ All facts verified 2026-10-15. Paths are relative to each repo's root.
 
 ### Phase 1 — Typing, global shortcut, app search
 
-Status: **Kicked off 2026-10-15; not started.** Repo: MyNotch only. D6 resolved at kickoff.
+Status: **Done 2026-10-15.** Task 1-1 `4bfe42e`, Task 1-2 `8251ab7`, Task 1-3 `27e6323` (runtime checks recorded in HANDOFF.md). Repo: MyNotch only. D6 resolved at kickoff and amended at the end (default Ctrl+Alt+K).
 
 Docs: [Phase-1-Overview](Tasks/Phase-1-Overview.md) (decisions P1-D1…P1-D13), [Task 1-1](Tasks/Task-1-1.md), [Task 1-2](Tasks/Task-1-2.md), [Task 1-3](Tasks/Task-1-3.md), with their [ImplementationSpecs](ImplementationSpecs/).
 

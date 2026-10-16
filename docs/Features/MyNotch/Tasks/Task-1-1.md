@@ -1,6 +1,6 @@
 # Task 1-1 — Typing foundation and the tab-row search bar
 
-Status: **ready; not started.** Depends on nothing. Paired spec: [ImplementationSpec-1-1](../ImplementationSpecs/ImplementationSpec-1-1.md).
+Status: **done 2026-10-15** in `4bfe42e`. Depends on nothing. Paired spec: [ImplementationSpec-1-1](../ImplementationSpecs/ImplementationSpec-1-1.md).
 
 ## Source Of Truth
 

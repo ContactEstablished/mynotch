@@ -1,5 +1,7 @@
 # Implementation spec 1-3 — Global shortcut, Settings recorder, phase end
 
+Amended 2026-10-15: the default shortcut is **Ctrl+Alt+K**, not Ctrl+Alt+Space (Claude desktop owns that on the dev PC; see Phase-1-Overview P1-D1). Where this spec says Ctrl+Alt+Space for the default, read Ctrl+Alt+K; T11 was run as a startup conflict, because a combination another app owns never reaches MyNotch, even while recording.
+
 Companion: [Task 1-3](../Tasks/Task-1-3.md). Overview: [Phase 1](../Tasks/Phase-1-Overview.md). Builds on [ImplementationSpec-1-1](ImplementationSpec-1-1.md) and [ImplementationSpec-1-2](ImplementationSpec-1-2.md). Line numbers in `settings.rs`, `settings_panel.rs`, `desktop.rs` and `main.rs` are from `63f6951`; Tasks 1-1/1-2 don't touch those files, except `main.rs`, which gains `mod text;`. `src/app.rs` numbers are baseline; find code by function name.
 
 ## 1. Files and boundaries
