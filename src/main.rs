@@ -5,6 +5,7 @@ mod apps;
 mod clipboard;
 mod desktop;
 mod gfx;
+mod hotkey;
 mod icon;
 mod imaging;
 mod media;

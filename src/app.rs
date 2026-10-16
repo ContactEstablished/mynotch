@@ -16,8 +16,9 @@ use windows::{
         UI::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN,
-                VK_F4, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_TAB, VK_UP,
+                GetAsyncKeyState, GetKeyState, HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture,
+                SetCapture, SetFocus, UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE,
+                VK_F4, VK_LBUTTON, VK_LWIN, VK_MENU, VK_RBUTTON, VK_RWIN, VK_SHIFT, VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW,
@@ -32,9 +33,10 @@ use windows::{
 use crate::clipboard;
 use crate::desktop::{self, autostart};
 use crate::gfx::{Align, Brushes, Canvas, Font, Fonts, ImageCache, Ink, Look, Rect, glyph};
+use crate::hotkey::{self, Hotkey};
 use crate::icon;
 use crate::settings::Settings;
-use crate::settings_panel::{self, Hit};
+use crate::settings_panel::{self, Hit, ShortcutRow};
 use crate::text::{self, Command, TextField, Utf16Joiner};
 use crate::widgets::{self, Compact, SearchAction, SearchKey, Widget};
 
@@ -46,6 +48,7 @@ const PEEK: Duration = Duration::from_secs(6);
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
+const HOTKEY_ID: i32 = 1;
 const CMD_PIN: usize = 1;
 const CMD_FULLSCREEN: usize = 2;
 const CMD_AUTOSTART: usize = 3;
@@ -344,6 +347,8 @@ enum Modal {
 enum Owner {
     /// The tab-row search field.
     Search,
+    /// The Settings tab's shortcut recorder.
+    Shortcut,
 }
 
 /// Keyboard focus the notch took after an explicit user action; see `begin_typing`.
@@ -396,6 +401,8 @@ struct App {
     results: Option<usize>,
     /// Pairs UTF-16 surrogates from WM_CHAR.
     joiner: Utf16Joiner,
+    /// Windows refused to register the saved shortcut (another app has it).
+    hotkey_taken: bool,
     dirty: bool,
 }
 
@@ -439,6 +446,7 @@ pub fn run() -> Result<()> {
         )?;
 
         let mut app = App::new(hwnd)?;
+        app.register_hotkey();
         app.render();
         app.refresh_icon(NIM_ADD);
         APP.with(|a| *a.borrow_mut() = Some(app));
@@ -498,6 +506,7 @@ impl App {
                 search: None,
                 results: None,
                 joiner: Utf16Joiner::default(),
+                hotkey_taken: false,
                 dirty: true,
             })
         }
@@ -630,6 +639,9 @@ impl App {
         let Some(kb) = self.keyboard.take() else { return };
         match kb.owner {
             Owner::Search => (self.search, self.results) = (None, None),
+            // Every way out of recording (a key, Esc, a click anywhere) registers whatever is
+            // saved now.
+            Owner::Shortcut => self.register_hotkey(),
         }
         self.joiner = Utf16Joiner::default();
         self.dirty = true;
@@ -643,6 +655,92 @@ impl App {
                 let _ = SetForegroundWindow(prev);
             }
         }
+    }
+
+    /// Registers the saved shortcut (replacing any earlier registration), noting a refusal.
+    /// Outside recording, what's registered is exactly `settings.hotkey`.
+    fn register_hotkey(&mut self) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            self.hotkey_taken = match self.settings.hotkey {
+                // MOD_NOREPEAT: holding the shortcut doesn't toggle search over and over.
+                Some(h) => {
+                    let modifiers = HOT_KEY_MODIFIERS(h.modifiers()) | MOD_NOREPEAT;
+                    RegisterHotKey(Some(self.hwnd), HOTKEY_ID, modifiers, u32::from(h.vk)).is_err()
+                }
+                None => false,
+            };
+        }
+        self.dirty = true;
+    }
+
+    /// The global shortcut: toggles search from any app, even while hidden over a fullscreen
+    /// one. Windows lets the process that receives a hotkey take the foreground.
+    fn on_hotkey(&mut self) {
+        if self.modal_open {
+            return;
+        }
+        match self.keyboard.as_ref().map(|kb| kb.owner) {
+            Some(Owner::Search) => self.end_typing(true),
+            // Can't happen: nothing is registered while recording.
+            Some(Owner::Shortcut) => {}
+            None => {
+                self.unhide();
+                self.open_search();
+            }
+        }
+    }
+
+    /// Brings the notch back from hiding over a fullscreen app, so it can take the
+    /// foreground. Once it has it, the fullscreen check ignores our own window; after the
+    /// focus goes back, the next check hides it again.
+    fn unhide(&mut self) {
+        if self.hidden {
+            self.hidden = false;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+        self.next_fullscreen_check = Instant::now() + FULLSCREEN_POLL;
+    }
+
+    fn recording(&self) -> bool {
+        self.keyboard.as_ref().is_some_and(|kb| kb.owner == Owner::Shortcut)
+    }
+
+    /// The Shortcut chip was clicked: unregister the shortcut, so even the current one
+    /// arrives as ordinary keys, and wait for a combination.
+    fn start_recording(&mut self) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+        }
+        if !self.begin_typing(Owner::Shortcut) {
+            self.register_hotkey();
+        }
+        self.dirty = true;
+    }
+
+    /// A key pressed while recording. Settings change before `end_typing`, so its cleanup
+    /// registers the new value.
+    fn record_key(&mut self, vk: u16) {
+        if hotkey::is_modifier(vk) {
+            return; // Wait for the real key.
+        }
+        let (ctrl, alt, shift) = (key_down(VK_CONTROL), key_down(VK_MENU), key_down(VK_SHIFT));
+        let win = key_down(VK_LWIN) || key_down(VK_RWIN);
+        let bare = !(ctrl || alt || shift || win);
+        if bare && vk == VK_ESCAPE.0 {
+            self.end_typing(true);
+        } else if bare && (vk == VK_BACK.0 || vk == VK_DELETE.0) {
+            self.settings.hotkey = None;
+            self.settings.save();
+            self.end_typing(true);
+        } else if let Some(h) = Hotkey::new(ctrl, alt, shift, win, vk) {
+            self.settings.hotkey = Some(h);
+            self.settings.save();
+            self.end_typing(true);
+        }
+        // Anything else (Ctrl+C, Shift+A, Tab…) isn't allowed: keep waiting.
     }
 
     /// Opens the tab-row search with an empty query (which shows the pinned apps) and takes
@@ -715,6 +813,11 @@ impl App {
     /// if not, it goes on to `DefWindowProcW`.
     fn on_key(&mut self, vk: u16, sys: bool) -> bool {
         let Some(owner) = self.keyboard.as_ref().map(|kb| kb.owner) else { return false };
+        if owner == Owner::Shortcut {
+            // The recorder takes every key, Alt combinations included (it refuses Alt+F4).
+            self.record_key(vk);
+            return true;
+        }
         if sys {
             // DefWindowProcW would turn Alt+F4 into closing MyNotch: treat it as Esc instead.
             if vk == VK_F4.0 {
@@ -728,6 +831,7 @@ impl App {
         let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
         let shift = key_down(VK_SHIFT);
         match owner {
+            Owner::Shortcut => {}
             Owner::Search => {
                 // Down/Up (and Tab) move through the results; Left/Right stay with the caret.
                 let nav = match vk {
@@ -794,6 +898,8 @@ impl App {
         let Some(owner) = self.keyboard.as_ref().map(|kb| kb.owner) else { return false };
         if let Some(c) = self.joiner.push(unit) {
             match owner {
+                // The recorder works from key-downs; the chars are just swallowed.
+                Owner::Shortcut => {}
                 Owner::Search => {
                     let changed = self.search.as_mut().is_some_and(|field| {
                         let before = field.text().to_owned();
@@ -970,9 +1076,13 @@ impl App {
         if PIN.contains(lx, ly) {
             self.toggle_pin();
         } else if let Some(t) = (0..tab_count(&self.widgets)).find(|&t| tab_rect(&self.widgets, t).contains(lx, ly)) {
-            // Picking a tab while searching closes search and gives the focus back.
+            // Picking a tab while typing (searching or recording) ends it and gives the focus
+            // back.
             self.end_typing(true);
             self.select_tab(t);
+        } else if self.recording() {
+            // Any other press, the chip included, stops recording and keeps the shortcut.
+            self.end_typing(true);
         } else if self.search.is_some() {
             // While searching, only the field (placing the caret) and the results take clicks.
             if field_rect(&self.widgets).contains(lx, ly) {
@@ -1006,6 +1116,7 @@ impl App {
                     self.settings.save();
                     self.dirty = true;
                 }
+                Hit::Shortcut => self.start_recording(),
             }
         } else if CONTENT.contains(lx, ly) {
             let (cx, cy) = (lx - CONTENT.x, ly - CONTENT.y);
@@ -1181,7 +1292,8 @@ impl App {
                         self.widgets[i].draw_card(&inner, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0);
                     }
                 } else if self.active == settings_tab(&self.widgets) {
-                    settings_panel::draw(&content, CONTENT.w, &self.settings);
+                    let shortcut = ShortcutRow { recording: self.recording(), taken: self.hotkey_taken };
+                    settings_panel::draw(&content, CONTENT.w, &self.settings, shortcut);
                 } else {
                     self.widgets[self.active - 1].draw(&content, CONTENT.w, CONTENT.h);
                 }
@@ -1510,6 +1622,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             with_app(|a| handled = a.on_char(wparam.0 as u16));
             if handled { LRESULT(0) } else { unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } }
         }
+        // While recording a shortcut, keep Alt from opening the system menu (Alt+Space) or
+        // entering menu mode (an Alt tap).
+        WM_SYSCHAR | WM_SYSKEYUP => {
+            let mut recording = false;
+            with_app(|a| recording = a.recording());
+            if recording { LRESULT(0) } else { unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) } }
+        }
+        WM_HOTKEY if wparam.0 == HOTKEY_ID as usize => {
+            with_app(|a| a.on_hotkey());
+            LRESULT(0)
+        }
         // The user went elsewhere: stop typing, and leave the focus where it went.
         // DefWindowProcW must still see it; it's what moves the keyboard focus.
         WM_ACTIVATE => {
@@ -1548,6 +1671,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_DESTROY => {
+            unsafe {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            }
             tray_notify(hwnd, NIM_DELETE, HICON::default());
             unsafe { PostQuitMessage(0) };
             LRESULT(0)

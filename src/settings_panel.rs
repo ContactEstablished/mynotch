@@ -1,4 +1,4 @@
-//! The Settings tab: the notch's colour, opacity and position.
+//! The Settings tab: the notch's colour, opacity, position and global shortcut.
 
 use std::cell::Cell;
 
@@ -38,8 +38,11 @@ pub const PRESETS: [(&str, u32); 9] = [
 /// Opacity moves in steps of this many percent.
 const STEP: u32 = 5;
 
-const ROW_H: f32 = 56.0;
+/// Four rows fill the 176 px content area: 4 + 4 × 43.
+const ROW_H: f32 = 43.0;
 const ROW_Y: f32 = 4.0;
+// 176 is the content area's height (`CONTENT` in app.rs).
+const _: () = assert!(ROW_Y + ROW_H * 4.0 <= 176.0, "the Settings rows must fit the panel");
 const LABEL_W: f32 = 96.0;
 const SWATCH: f32 = 26.0;
 const SWATCH_PITCH: f32 = 36.0;
@@ -48,6 +51,10 @@ const SWATCHES: usize = PRESETS.len() + 1;
 /// Room kept at the slider's ends for its knob.
 const KNOB_R: f32 = 8.0;
 const CHIP: (f32, f32) = (76.0, 26.0);
+/// Wide enough for "Ctrl+Alt+Shift+PageDown".
+const SHORTCUT_W: f32 = 168.0;
+/// Amber, for the shortcut-conflict note.
+const WARN: Rgb = Rgb(255, 176, 92);
 
 /// What a click on the panel landed on.
 pub enum Hit {
@@ -57,6 +64,17 @@ pub enum Hit {
     /// The opacity slider; see `opacity_at`.
     Opacity,
     Center,
+    /// The Shortcut chip: start recording a new shortcut.
+    Shortcut,
+}
+
+/// What the Shortcut row shows besides the saved shortcut.
+#[derive(Clone, Copy, Default)]
+pub struct ShortcutRow {
+    /// Waiting for the user to press a combination.
+    pub recording: bool,
+    /// Windows refused to register the saved shortcut.
+    pub taken: bool,
 }
 
 pub fn look(settings: &Settings) -> Look {
@@ -83,6 +101,10 @@ fn center_chip() -> Rect {
     Rect::new(LABEL_W, row_centre(2) - CHIP.1 / 2.0, CHIP.0, CHIP.1)
 }
 
+fn shortcut_chip() -> Rect {
+    Rect::new(LABEL_W, row_centre(3) - CHIP.1 / 2.0, SHORTCUT_W, CHIP.1)
+}
+
 /// The opacity the slider gives at content x `x`.
 pub fn opacity_at(x: f32) -> u32 {
     let o = OPACITY_MIN as f32 + slider_at(track(), x) * (100 - OPACITY_MIN) as f32;
@@ -103,10 +125,13 @@ pub fn hit(x: f32, y: f32) -> Option<Hit> {
     if slider_hit(track()).contains(x, y) {
         return Some(Hit::Opacity);
     }
+    if shortcut_chip().contains(x, y) {
+        return Some(Hit::Shortcut);
+    }
     center_chip().contains(x, y).then_some(Hit::Center)
 }
 
-pub fn draw(cv: &Canvas, w: f32, settings: &Settings) {
+pub fn draw(cv: &Canvas, w: f32, settings: &Settings, shortcut: ShortcutRow) {
     let label = |i: usize, text: &str| {
         cv.text(text, Font::Label, Ink::Dim, Rect::new(0.0, row_centre(i) - 12.0, LABEL_W, 24.0), Align::Left);
     };
@@ -155,6 +180,23 @@ pub fn draw(cv: &Canvas, w: f32, settings: &Settings) {
     cv.text("Center", Font::Small, if centred { Ink::Dim } else { Ink::Text }, chip, Align::Center);
     let hint = "Or drag the empty space beside the tabs to slide the notch";
     cv.text(hint, Font::Small, Ink::Dim, after(chip), Align::Left);
+
+    // Shortcut: click the chip, then press the new combination.
+    label(3, "Shortcut");
+    let chip = shortcut_chip();
+    let fill = if shortcut.recording || cv.hovered(chip) { Ink::Hover } else { Ink::Track };
+    cv.fill(chip, CHIP.1 / 2.0, fill);
+    let saved = settings.hotkey.map(|h| h.to_string());
+    let (text, ink, note, note_ink) = match (&saved, shortcut) {
+        (_, ShortcutRow { recording: true, .. }) => {
+            ("Press a shortcut…", Ink::Accent, "Esc cancels · Backspace clears", Ink::Dim)
+        }
+        (Some(s), ShortcutRow { taken: true, .. }) => (s.as_str(), Ink::Text, "Taken by another app", Ink::Rgb(WARN)),
+        (Some(s), _) => (s.as_str(), Ink::Text, "Opens app search from anywhere", Ink::Dim),
+        (None, _) => ("None", Ink::Dim, "Click to set a shortcut", Ink::Dim),
+    };
+    cv.text(text, Font::Small, ink, chip, Align::Center);
+    cv.text(note, Font::Small, note_ink, after(chip), Align::Left);
 }
 
 fn colorref(c: u32) -> COLORREF {
@@ -250,7 +292,31 @@ pub fn pick_color(owner: HWND, initial: u32, picker: Picker) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OPACITY_MIN, opacity_at, track, wheel_opacity};
+    use super::{Hit, LABEL_W, OPACITY_MIN, center_chip, hit, opacity_at, shortcut_chip, swatch, track, wheel_opacity};
+
+    fn centre(r: crate::gfx::Rect) -> (f32, f32) {
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn four_rows_fit_the_content_area() {
+        // The rows themselves are checked at compile time, beside ROW_H. 176 is the content
+        // area's height (`CONTENT` in app.rs).
+        assert!(shortcut_chip().y + shortcut_chip().h <= 176.0);
+    }
+
+    #[test]
+    fn hit_finds_each_row() {
+        let at = |r| {
+            let (x, y) = centre(r);
+            hit(x, y)
+        };
+        assert!(matches!(at(swatch(0)), Some(Hit::Preset(_))));
+        assert!(matches!(at(track()), Some(Hit::Opacity)));
+        assert!(matches!(at(center_chip()), Some(Hit::Center)));
+        assert!(matches!(at(shortcut_chip()), Some(Hit::Shortcut)));
+        assert!(hit(LABEL_W + 10.0, 133.0).is_none(), "between the Position and Shortcut chips");
+    }
 
     #[test]
     fn slider_maps_its_length_to_the_opacity_range_in_steps() {

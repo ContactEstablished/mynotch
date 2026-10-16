@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::hotkey::Hotkey;
+
 /// The default body colour, obsidian, as `0xRRGGBB`.
 pub const DEFAULT_COLOR: u32 = 0x0B0912;
 /// The most see-through the body may be, in percent.
@@ -27,6 +29,8 @@ pub struct Settings {
     pub opacity: u32,
     /// Where the notch sits along the top of the screen: 0 = flush left, 1 = flush right.
     pub position: f32,
+    /// The global shortcut that opens app search; `None` = no shortcut.
+    pub hotkey: Option<Hotkey>,
 }
 
 impl Default for Settings {
@@ -40,6 +44,7 @@ impl Default for Settings {
             color: DEFAULT_COLOR,
             opacity: 100,
             position: 0.5,
+            hotkey: Some(Hotkey::DEFAULT),
         }
     }
 }
@@ -102,6 +107,10 @@ impl Settings {
                         s.position = p.clamp(0.0, 1.0);
                     }
                 }
+                // Empty means no shortcut; one that can't be read falls back to the default
+                // rather than quietly turning the shortcut off.
+                "hotkey" if value.is_empty() => s.hotkey = None,
+                "hotkey" => s.hotkey = Some(Hotkey::parse(value).unwrap_or(Hotkey::DEFAULT)),
                 _ => {}
             }
         }
@@ -122,6 +131,8 @@ impl Settings {
         if let Some(apps) = &self.apps {
             text += &format!("apps={}\n", apps.join("|"));
         }
+        // Always written, so "none" stays distinct from "never set" (the default).
+        text += &format!("hotkey={}\n", self.hotkey.map(|h| h.to_string()).unwrap_or_default());
         text
     }
 }
@@ -133,6 +144,7 @@ fn path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+    use crate::hotkey::Hotkey;
 
     #[test]
     fn round_trips() {
@@ -145,6 +157,7 @@ mod tests {
             color: 0x14284A,
             opacity: 65,
             position: 0.3125,
+            hotkey: Some(Hotkey { ctrl: true, alt: false, shift: true, win: false, vk: 0x4B }),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
         let apps = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Brave".to_string()];
@@ -152,6 +165,17 @@ mod tests {
         assert_eq!(Settings::parse(&s.serialize()), s);
         let s = Settings { apps: Some(Vec::new()), ..s };
         assert_eq!(Settings::parse(&s.serialize()), s, "all unpinned stays distinct from never set");
+        let s = Settings { hotkey: None, ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s, "no shortcut stays distinct from never set");
+    }
+
+    #[test]
+    fn hotkey_defaults_clears_and_falls_back() {
+        assert_eq!(Settings::parse("").hotkey, Some(Hotkey::DEFAULT));
+        assert_eq!(Settings::parse("hotkey=").hotkey, None);
+        assert_eq!(Settings::parse("hotkey=Ctrl+Shift+K").hotkey, Hotkey::parse("Ctrl+Shift+K"));
+        assert_eq!(Settings::parse("hotkey=Shift+K").hotkey, Some(Hotkey::DEFAULT));
+        assert_eq!(Settings::parse("hotkey=nonsense").hotkey, Some(Hotkey::DEFAULT));
     }
 
     #[test]
