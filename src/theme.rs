@@ -23,6 +23,8 @@ pub mod color {
     pub const MOON: Rgb = Rgb::from_hex(0xE4EEFA);
     /// Warnings, such as a shortcut another app owns.
     pub const WARN: Rgb = Rgb::from_hex(0xFFB05C);
+    /// Recording: the dot and the glow while voice listens.
+    pub const RECORD: Rgb = Rgb::from_hex(0xFF5D73);
     /// Behind selected text.
     pub const SELECTION: Rgb = Rgb::from_hex(0x24587A);
     /// The drop shadow, a blue-black rather than grey.

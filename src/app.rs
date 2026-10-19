@@ -41,7 +41,7 @@ use crate::motion::{self, Motion};
 use crate::settings::Settings;
 use crate::settings_panel::{self, Hit, PlaceRow, ShortcutRow};
 use crate::text::{self, Command, TextField, Utf16Joiner};
-use crate::theme::{motion as timing, space};
+use crate::theme::{self, motion as timing, space};
 use crate::voice::Voice;
 use crate::weather::Weather;
 use crate::widgets::{self, Compact, SearchAction, SearchKey, Widget};
@@ -62,6 +62,8 @@ const CMD_QUIT: usize = 4;
 
 // Logical (96-DPI) sizes.
 const COLLAPSED: (f32, f32) = (270.0, 32.0);
+/// The collapsed notch widens to this while voice's recording strip has it.
+const VOICE_WIDTH: f32 = 340.0;
 const EXPANDED: (f32, f32) = (720.0, 210.0);
 const RADIUS: f32 = space::BODY_RADIUS;
 /// Slack around the notch so the cursor grazing its edge doesn't flicker it.
@@ -281,13 +283,15 @@ struct Placement {
     origin: f32,
 }
 
-/// Screen x of the body's left edge when collapsed and when expanded, at `position` along a
-/// monitor spanning `left..left + width` (0 = collapsed notch flush left, 1 = flush right).
-/// Both centre on the same point, except that the expanded notch keeps its shadow on-screen.
-fn edges(left: f32, width: f32, scale: f32, position: f32) -> (f32, f32) {
+/// Screen x of the body's left edge when collapsed (`collapsed_w` logical px wide: it widens
+/// while voice records) and when expanded, at `position` along a monitor spanning
+/// `left..left + width` (0 = collapsed notch flush left, 1 = flush right). Both centre on the
+/// same point, except that the expanded notch keeps its shadow on-screen.
+fn edges(left: f32, width: f32, scale: f32, position: f32, collapsed_w: f32) -> (f32, f32) {
     let (cw, ew, shadow) = (COLLAPSED.0 * scale, EXPANDED.0 * scale, SHADOW * scale);
     let centre = left + cw / 2.0 + position.clamp(0.0, 1.0) * (width - cw);
-    let collapsed = (centre - cw / 2.0).clamp(left, (left + width - cw).max(left));
+    let now = collapsed_w * scale;
+    let collapsed = (centre - now / 2.0).clamp(left, (left + width - now).max(left));
     let expanded = (centre - ew / 2.0).clamp(left + shadow, (left + width - ew - shadow).max(left + shadow));
     (collapsed, expanded)
 }
@@ -327,9 +331,9 @@ impl Layout {
 
     /// The window sits around the expanded notch; the fixed-size expanded layout stays put
     /// there (clipped to the body) while the body animates between its two positions.
-    fn place(&self, position: f32, t: f32) -> Placement {
+    fn place(&self, position: f32, t: f32, collapsed_w: f32) -> Placement {
         let m = &self.monitor;
-        let (collapsed, expanded) = edges(m.left as f32, (m.right - m.left) as f32, self.scale, position);
+        let (collapsed, expanded) = edges(m.left as f32, (m.right - m.left) as f32, self.scale, position, collapsed_w);
         let x = (expanded - SHADOW * self.scale).round() as i32;
         let body = lerp(collapsed, expanded, ease(t));
         Placement { x, y: m.top, body: body - x as f32, origin: expanded - x as f32 }
@@ -380,12 +384,7 @@ enum Modal {
     PickColor,
 }
 
-/// Where the collapsed readout comes from: a widget (by index), or voice, which has no tab.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Source {
-    Widget(usize),
-    Voice,
-}
+
 
 /// Who holds the keyboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -456,8 +455,10 @@ struct App {
     place_field: Option<TextField>,
     /// Local weather, for the Time tab; the place comes from Settings.
     weather: Rc<Weather>,
-    /// Hold Right Ctrl to dictate; its readout shows in the rail.
+    /// Hold Right Ctrl to dictate; its recording strip takes the notch while you do.
     voice: Voice,
+    /// 0..1: how far the collapsed notch has widened for the recording strip.
+    voice_w: f32,
     /// The widget showing search results (by index into `widgets`), while searching.
     results: Option<usize>,
     /// Pairs UTF-16 surrogates from WM_CHAR.
@@ -583,6 +584,7 @@ impl App {
                 place_field: None,
                 weather,
                 voice: Voice::start(),
+                voice_w: 0.0,
                 results: None,
                 joiner: Utf16Joiner::default(),
                 hotkey_taken: false,
@@ -689,7 +691,7 @@ impl App {
     }
 
     fn placement(&self) -> Placement {
-        self.layout.place(self.settings.position, self.t)
+        self.layout.place(self.settings.position, self.t, self.collapsed_w())
     }
 
     /// The cursor in expanded-layout logical coordinates.
@@ -1112,15 +1114,8 @@ impl App {
         true
     }
 
-    /// The collapsed readout, and where it comes from: voice while you dictate, else the
-    /// top-priority widget's.
-    fn compact(&self) -> Option<(Source, Compact)> {
-        let widget = self.widget_compact().map(|(i, c)| (Source::Widget(i), c));
-        self.voice.compact().map(|c| (Source::Voice, c)).into_iter().chain(widget).max_by_key(|(_, c)| c.priority)
-    }
-
-    /// The top-priority widget's readout, and the index of the widget providing it.
-    fn widget_compact(&self) -> Option<(usize, Compact)> {
+    /// The collapsed readout, and the index of the widget providing it.
+    fn compact(&self) -> Option<(usize, Compact)> {
         self.widgets
             .iter()
             .enumerate()
@@ -1128,18 +1123,15 @@ impl App {
             .max_by_key(|(_, c)| c.priority)
     }
 
-    /// Whether the readout's source is moving by itself (its live dot breathes).
-    fn source_animating(&self, source: Source) -> bool {
-        match source {
-            Source::Widget(i) => self.widgets[i].animating(),
-            Source::Voice => self.voice.animating(),
-        }
+    /// The collapsed notch's width now: wider while voice's recording strip has it.
+    fn collapsed_w(&self) -> f32 {
+        collapsed_width(self.voice_w)
     }
 
     /// Current notch size in physical pixels.
     fn notch_size(&self) -> (f32, f32) {
         let e = ease(self.t);
-        let w = lerp(COLLAPSED.0, EXPANDED.0, e) * self.layout.scale;
+        let w = lerp(self.collapsed_w(), EXPANDED.0, e) * self.layout.scale;
         let h = lerp(COLLAPSED.1, EXPANDED.1, e) * self.layout.scale;
         (w, h)
     }
@@ -1164,8 +1156,17 @@ impl App {
             self.settings.place = Some((query, Some(place)));
             self.settings.save();
         }
-        // Voice: redraw when its readout in the rail changes.
+        // Voice: redraw when its strip changes. While it has the notch, it shows over a
+        // fullscreen app too (the next fullscreen check hides it again afterwards).
         if self.voice.poll(now) {
+            self.dirty = true;
+        }
+        if self.voice.showing() {
+            self.unhide();
+        }
+        let wide = if self.voice.showing() { 1.0 } else { 0.0 };
+        if self.voice_w != wide {
+            self.voice_w = if motion::reduced() { wide } else { approach(self.voice_w, wide, ANIMATION_STEP) };
             self.dirty = true;
         }
         if let Some(i) = self.widgets.iter_mut().position(|w| w.take_attention()) {
@@ -1272,7 +1273,7 @@ impl App {
             // Opening from collapsed: Home if that's where the user left it (it shows the live
             // activity anyway); else live activity (music, a running timer) takes the stage;
             // else the tab the user last picked; else Home.
-            self.active = match (tab_named(&self.widgets, &self.settings.tab), self.widget_compact()) {
+            self.active = match (tab_named(&self.widgets, &self.settings.tab), self.compact()) {
                 (Some(HOME), _) => HOME,
                 (_, Some((i, c))) if c.live => i + 1,
                 (saved, _) => saved.unwrap_or(HOME),
@@ -1311,16 +1312,20 @@ impl App {
         if motion::reduced() || self.hidden {
             return None;
         }
-        if self.t < 0.5 {
-            return self.compact().is_some_and(|(source, c)| c.live && self.source_animating(source)).then_some(2);
-        }
-        let moving = match self.active {
-            _ if self.search.is_some() => false,
-            HOME => self.widgets.iter().any(|w| w.card_weight().is_some() && w.card_animating()),
-            t if t == settings_tab(&self.widgets) => false,
-            t => self.widgets[t - 1].animating(),
+        // The recording strip's dot breathes, or its light sweeps while transcribing.
+        let voice = self.voice.animating().then_some(2);
+        let widgets = if self.t < 0.5 {
+            self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating()).then_some(2)
+        } else {
+            let moving = match self.active {
+                _ if self.search.is_some() => false,
+                HOME => self.widgets.iter().any(|w| w.card_weight().is_some() && w.card_animating()),
+                t if t == settings_tab(&self.widgets) => false,
+                t => self.widgets[t - 1].animating(),
+            };
+            moving.then_some(1)
         };
-        moving.then_some(1)
+        voice.into_iter().chain(widgets).min()
     }
 
     /// Left button down at window-relative physical coordinates.
@@ -1330,6 +1335,10 @@ impl App {
         }
         let s = self.layout.scale;
         let (lx, ly) = ((x as f32 - self.placement().origin) / s, y as f32 / s);
+        // Voice's recording strip covers the toolbar while you dictate.
+        if self.voice.showing() && ly < BAR {
+            return None;
+        }
 
         if PIN.contains(lx, ly) {
             self.toggle_pin();
@@ -1527,10 +1536,15 @@ impl App {
             let body = canvas(left, None);
             body.glass(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, e);
 
-            // Collapsed: the rail, with the clock and the top readout (voice, or a widget's).
+            // Collapsed: the rail, with the clock and the top-priority widget's readout; or,
+            // while you dictate, voice's recording strip.
             if e < 0.5 {
                 self.brushes.set_content_opacity(1.0 - e * 2.0);
-                self.draw_rail(&body, nw / s, nh / s);
+                if self.voice.showing() {
+                    self.voice.draw_rail(&body, nw / s, nh / s, RADIUS);
+                } else {
+                    self.draw_rail(&body, nw / s, nh / s);
+                }
             }
 
             // Expanded content: fixed layout, clipped to the animating body.
@@ -1539,7 +1553,16 @@ impl App {
                 let ox = p.origin;
                 let cv = canvas(ox, self.cursor);
                 cv.push_clip(Rect::new((left - ox) / s, 0.0, nw / s, nh / s));
-                self.draw_tabs(&cv);
+                let dictating = self.voice.showing();
+                if dictating {
+                    // Voice's recording strip takes the toolbar.
+                    cv.line((PAD, BAR - 0.5), (EXPANDED.0 - PAD, BAR - 0.5), Ink::Line);
+                    draw_logo(&cv);
+                    let strip = Rect::new(TABS_X, TAB_Y, EXPANDED.0 - PAD - 6.0 - TABS_X, TAB_H);
+                    self.voice.draw_toolbar(&cv, strip, BAR - 0.5);
+                } else {
+                    self.draw_tabs(&cv);
+                }
 
                 let content = cv.offset(CONTENT.x, CONTENT.y);
                 if self.search.is_some() {
@@ -1564,6 +1587,11 @@ impl App {
                     settings_panel::draw(&content, CONTENT.w, &self.settings, shortcut, place);
                 } else {
                     self.widgets[self.active - 1].draw(&content, CONTENT.w, CONTENT.h);
+                }
+                if dictating {
+                    // The panel steps back while you dictate.
+                    let scrim = Rect::new(PAD / 2.0, BAR + 2.0, EXPANDED.0 - PAD, EXPANDED.1 - BAR - 8.0);
+                    cv.fill_a(scrim, space::CARD_RADIUS, Ink::Rgb(theme::color::SHADOW), 0.6);
                 }
                 cv.pop_clip();
             }
@@ -1617,12 +1645,13 @@ impl App {
 
     /// The body in screen px at expansion `t`: its left, right and bottom (its top is the
     /// monitor's).
-    fn body_at(&self, t: f32) -> (f32, f32, f32) {
+    fn body_at(&self, t: f32, voice_w: f32) -> (f32, f32, f32) {
         let s = self.layout.scale;
-        let p = self.layout.place(self.settings.position, t);
+        let cw = collapsed_width(voice_w);
+        let p = self.layout.place(self.settings.position, t, cw);
         let e = ease(t);
         let left = p.x as f32 + p.body;
-        (left, left + lerp(COLLAPSED.0, EXPANDED.0, e) * s, p.y as f32 + lerp(COLLAPSED.1, EXPANDED.1, e) * s)
+        (left, left + lerp(cw, EXPANDED.0, e) * s, p.y as f32 + lerp(COLLAPSED.1, EXPANDED.1, e) * s)
     }
 
     /// Where the blur goes: inside the body, both where it is now and where it will be next
@@ -1633,8 +1662,9 @@ impl App {
         if self.hidden || self.fade < 1.0 || !self.transparency || self.settings.opacity >= 100 {
             return None;
         }
-        let next = if motion::reduced() { self.target } else { approach(self.t, self.target, ANIMATION_STEP) };
-        let (now, then) = (self.body_at(self.t), self.body_at(next));
+        let step = |at: f32, to: f32| if motion::reduced() { to } else { approach(at, to, ANIMATION_STEP) };
+        let wide = if self.voice.showing() { 1.0 } else { 0.0 };
+        let (now, then) = (self.body_at(self.t, self.voice_w), self.body_at(step(self.t, self.target), step(self.voice_w, wide)));
         let inset = BLUR_INSET * self.layout.scale;
         let left = now.0.max(then.0) + inset;
         let right = now.1.min(then.1) - inset;
@@ -1652,7 +1682,7 @@ impl App {
     }
 
     /// The collapsed notch: the time, the sky and the temperature on the left, the
-    /// top readout (voice while dictating, a running timer, the song playing, CPU and RAM) on the
+    /// top-priority widget's readout (a running timer, the song playing, CPU and RAM) on the
     /// right, and a hairline of progress along the bottom while a timer runs or a song plays.
     fn draw_rail(&self, cv: &Canvas, w: f32, h: f32) {
         let baseline = h / 2.0 + 5.0;
@@ -1669,12 +1699,12 @@ impl App {
             let degrees = format!("{:.0}°", report.temperature.round() + 0.0);
             x += 25.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 25.0, baseline, Align::Left);
         }
-        let Some((source, compact)) = self.compact() else { return };
+        let Some((i, compact)) = self.compact() else { return };
         cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
         let mut x = x + 18.0;
         if compact.live {
-            // It breathes while a timer or stopwatch runs, or voice is listening.
-            let swell = if self.source_animating(source) && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
+            // It breathes while a timer or stopwatch runs.
+            let swell = if self.widgets[i].animating() && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
             cv.halo(x + 2.5, h / 2.0, 2.0 + 1.5 * swell, Ink::Accent, 0.3 + 0.7 * swell);
             cv.circle(x + 2.5, h / 2.0, 2.5, Ink::Accent, None);
             x += 10.0;
@@ -1710,17 +1740,7 @@ impl App {
         let widgets = &self.widgets;
         let searching = self.search.is_some();
         cv.line((PAD, BAR - 0.5), (EXPANDED.0 - PAD, BAR - 0.5), Ink::Line);
-
-        // The mark: a lit ring around a core, with a planet in orbit just outside it.
-        let (mx, my) = (LOGO.x + LOGO.w / 2.0 - 1.0, LOGO.y + LOGO.h / 2.0 + 1.0);
-        cv.halo(mx, my, 7.0, Ink::Accent, 0.35);
-        cv.ring(mx, my, 7.0, 1.6, 1.0, None, 1.0);
-        cv.circle(mx, my, 2.4, Ink::Text, None);
-        let orbit = 11.0 * std::f32::consts::FRAC_1_SQRT_2;
-        let (px, py) = (mx + orbit, my - orbit);
-        cv.halo(px, py, 2.0, Ink::Violet, 0.5);
-        cv.circle(px, py, 2.0, Ink::Violet, None);
-        cv.line((DIVIDER_X, TAB_Y + 7.0), (DIVIDER_X, TAB_Y + TAB_H - 7.0), Ink::Line);
+        draw_logo(cv);
 
         let mut named = None;
         for (t, target) in self.tabs().into_iter().enumerate() {
@@ -1790,6 +1810,25 @@ impl App {
 
 /// Whether (`x`, `y`), relative to the body's top-left, is inside a `w` x `h` notch whose
 /// bottom corners are rounded by `r` (the top corners are off-screen).
+/// The collapsed notch's width, `voice_w` (0..1) of the way to the recording strip's.
+fn collapsed_width(voice_w: f32) -> f32 {
+    lerp(COLLAPSED.0, VOICE_WIDTH, ease(voice_w))
+}
+
+/// The brand mark at the toolbar's left: a lit ring around a core, with a planet in orbit just
+/// outside it; and the divider after it.
+fn draw_logo(cv: &Canvas) {
+    let (mx, my) = (LOGO.x + LOGO.w / 2.0 - 1.0, LOGO.y + LOGO.h / 2.0 + 1.0);
+    cv.halo(mx, my, 7.0, Ink::Accent, 0.35);
+    cv.ring(mx, my, 7.0, 1.6, 1.0, None, 1.0);
+    cv.circle(mx, my, 2.4, Ink::Text, None);
+    let orbit = 11.0 * std::f32::consts::FRAC_1_SQRT_2;
+    let (px, py) = (mx + orbit, my - orbit);
+    cv.halo(px, py, 2.0, Ink::Violet, 0.5);
+    cv.circle(px, py, 2.0, Ink::Violet, None);
+    cv.line((DIVIDER_X, TAB_Y + 7.0), (DIVIDER_X, TAB_Y + TAB_H - 7.0), Ink::Line);
+}
+
 fn in_notch(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
     if x < 0.0 || x >= w || y < 0.0 || y >= h {
         return false;
@@ -2080,7 +2119,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 #[cfg(test)]
 mod tests {
-    use super::{COLLAPSED, EXPANDED, SHADOW, edges, in_notch};
+    use super::{COLLAPSED, EXPANDED, SHADOW, VOICE_WIDTH, in_notch};
+
+    fn edges(left: f32, width: f32, scale: f32, position: f32) -> (f32, f32) {
+        super::edges(left, width, scale, position, COLLAPSED.0)
+    }
 
     #[test]
     fn centred_notch_is_concentric_on_the_monitor() {
@@ -2104,6 +2147,17 @@ mod tests {
         let (collapsed, expanded) = edges(0.0, 1920.0, 1.0, 0.1);
         assert!(collapsed > 0.0 && expanded == SHADOW);
         assert!(collapsed >= expanded - SHADOW && collapsed + COLLAPSED.0 <= expanded + EXPANDED.0 + SHADOW, "inside the window");
+    }
+
+    #[test]
+    fn the_recording_strip_widens_the_notch_about_its_centre_and_stays_on_screen() {
+        let wide = |position| super::edges(0.0, 1920.0, 1.0, position, VOICE_WIDTH).0;
+        assert_eq!(wide(0.5) + VOICE_WIDTH / 2.0, 960.0, "same centre as the narrow notch");
+        assert_eq!(wide(0.3) + VOICE_WIDTH / 2.0, edges(0.0, 1920.0, 1.0, 0.3).0 + COLLAPSED.0 / 2.0);
+        assert_eq!(wide(0.0), 0.0, "flush left still");
+        assert_eq!(wide(1.0) + VOICE_WIDTH, 1920.0, "flush right still");
+        let (_, expanded) = edges(0.0, 1920.0, 1.0, 0.0);
+        assert!(wide(0.0) + VOICE_WIDTH <= expanded + EXPANDED.0 + SHADOW, "inside the window");
     }
 
     #[test]

@@ -8,7 +8,7 @@ mod convert;
 mod wav;
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -57,6 +57,8 @@ pub struct Recording {
     /// A message means finish; hanging up means discard.
     stop: Option<Sender<()>>,
     thread: Option<JoinHandle<Option<Result<Captured, AudioError>>>>,
+    /// The loudest 10 ms (RMS, as `f32` bits) since `level` last read it.
+    level: Arc<AtomicU32>,
 }
 
 /// Everything one `Recording` heard.
@@ -78,13 +80,15 @@ impl Recording {
     pub fn start() -> Result<Recording, AudioError> {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
+        let level = Arc::new(AtomicU32::new(0));
+        let meter = Arc::clone(&level);
         let thread = thread::Builder::new()
             .name("voice-audio".into())
-            .spawn(move || capture(&ready_tx, &stop_rx))
+            .spawn(move || capture(&ready_tx, &stop_rx, &meter))
             .map_err(|e| AudioError::new(format!("Can't start the audio thread: {e}")))?;
         match ready_rx.recv() {
             Ok(Ok(describe)) => {
-                Ok(Recording { describe, stop: Some(stop_tx), thread: Some(thread) })
+                Ok(Recording { describe, stop: Some(stop_tx), thread: Some(thread), level })
             }
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -101,6 +105,12 @@ impl Recording {
     /// "Microphone (Realtek) · 48000 Hz · 2 ch · f32".
     pub fn describe(&self) -> &str {
         &self.describe
+    }
+
+    /// How loud it has been since the last call: the RMS of the loudest 10 ms (0..1), for a
+    /// level meter.
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level.swap(0, Ordering::Relaxed))
     }
 
     /// Stops capture and returns everything captured as 16 kHz mono f32 (-1..1).
@@ -135,6 +145,7 @@ impl Drop for Recording {
 fn capture(
     ready: &Sender<Result<String, AudioError>>,
     stop: &Receiver<()>,
+    level: &AtomicU32,
 ) -> Option<Result<Captured, AudioError>> {
     let mic = match Mic::open() {
         Ok(mic) => mic,
@@ -144,7 +155,7 @@ fn capture(
         }
     };
     ready.send(Ok(mic.describe.clone())).ok()?;
-    mic.run(stop)
+    mic.run(stop, level)
 }
 
 /// What the stream's callbacks share with the audio thread.
@@ -230,13 +241,19 @@ impl Mic {
         Ok(Mic { stream, ring, rate, channels, shared, describe })
     }
 
-    /// Gathers audio until `stop` says finish (`Some`) or hangs up (`None`, discarded).
-    fn run(self, stop: &Receiver<()>) -> Option<Result<Captured, AudioError>> {
+    /// Gathers audio until `stop` says finish (`Some`) or hangs up (`None`, discarded),
+    /// keeping `level` up to date.
+    fn run(self, stop: &Receiver<()>, level: &AtomicU32) -> Option<Result<Captured, AudioError>> {
         let Mic { stream, mut ring, rate, channels, shared, .. } = self;
         let mut audio = Accumulator::for_device(rate, channels);
         loop {
             match stop.recv_timeout(DRAIN_EVERY) {
-                Err(RecvTimeoutError::Timeout) => audio.drain(&mut ring),
+                Err(RecvTimeoutError::Timeout) => {
+                    let before = audio.samples.len();
+                    audio.drain(&mut ring);
+                    // Non-negative floats order the same as their bits, so this keeps the loudest.
+                    level.fetch_max(convert::rms(&audio.samples[before..]).to_bits(), Ordering::Relaxed);
+                }
                 Ok(()) => break,
                 Err(RecvTimeoutError::Disconnected) => return None,
             }

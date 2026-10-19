@@ -43,6 +43,8 @@ pub enum Effect {
     /// Stop capturing and transcribe what was heard.
     Transcribe(SessionId),
     Deliver(SessionId, String),
+    /// Sessions' events. `SessionStarted` and `Delivered` leave `app` empty: the pipeline
+    /// doesn't know the window, so the service fills it in.
     Emit(VoiceEvent),
 }
 
@@ -89,7 +91,7 @@ impl Pipeline {
                 let error = self.mic_error.take().unwrap_or_else(|| MIC_NOT_READY.into());
                 (Idle, vec![Emit(VoiceEvent::Failed { id, error })])
             }
-            (Arming(id), MicReady(m)) if m == id => (Listening(id), vec![Emit(VoiceEvent::SessionStarted { id })]),
+            (Arming(id), MicReady(m)) if m == id => (Listening(id), vec![Emit(VoiceEvent::SessionStarted { id, app: String::new() })]),
             (Arming(id), MicFailed(m, error)) if m == id => {
                 self.mic_error = Some(error);
                 (Arming(id), vec![])
@@ -106,7 +108,7 @@ impl Pipeline {
                 }
             }
             (Transcribing(id), TranscribeFailed(t, error)) if t == id => (Idle, vec![Emit(VoiceEvent::Failed { id, error })]),
-            (Delivering(id), Delivered(d)) if d == id => (Idle, vec![Emit(VoiceEvent::Delivered { id })]),
+            (Delivering(id), Delivered(d)) if d == id => (Idle, vec![Emit(VoiceEvent::Delivered { id, app: String::new() })]),
             (Delivering(id), DeliverFailed(d, error)) if d == id => (Idle, vec![Emit(VoiceEvent::Failed { id, error })]),
             // A microphone that finished opening for a session that's gone.
             (phase, MicReady(stale)) => (phase, vec![DropMic(stale)]),
@@ -143,14 +145,14 @@ mod tests {
         let mut p = Pipeline::new();
         assert_eq!(p.handle(Input::Start), vec![OpenMic(1)]);
         assert_eq!(p.phase(), Phase::Arming(1));
-        assert_eq!(p.handle(Input::MicReady(1)), vec![emit(VoiceEvent::SessionStarted { id: 1 })]);
+        assert_eq!(p.handle(Input::MicReady(1)), vec![emit(VoiceEvent::SessionStarted { id: 1, app: String::new() })]);
         assert_eq!(p.handle(Input::Stop), vec![Transcribe(1), emit(VoiceEvent::Transcribing { id: 1 })]);
         assert_eq!(
             p.handle(Input::Transcribed(1, "Hello.".into())),
             vec![emit(VoiceEvent::Transcript { id: 1, text: "Hello.".into() }), Deliver(1, "Hello.".into())]
         );
         assert_eq!(p.phase(), Phase::Delivering(1));
-        assert_eq!(p.handle(Input::Delivered(1)), vec![emit(VoiceEvent::Delivered { id: 1 })]);
+        assert_eq!(p.handle(Input::Delivered(1)), vec![emit(VoiceEvent::Delivered { id: 1, app: String::new() })]);
         assert_eq!(p.phase(), Phase::Idle);
         assert_eq!(p.handle(Input::Start), vec![OpenMic(2)], "the next session gets a new id");
     }
@@ -209,7 +211,7 @@ mod tests {
         // Also while the microphone is still opening; its late arrival is closed.
         assert_eq!(p.handle(Input::Start), vec![DropMic(2), emit(VoiceEvent::Cancelled { id: 2 }), OpenMic(3)]);
         assert_eq!(p.handle(Input::MicReady(2)), vec![DropMic(2)]);
-        assert_eq!(p.handle(Input::MicReady(3)), vec![emit(VoiceEvent::SessionStarted { id: 3 })]);
+        assert_eq!(p.handle(Input::MicReady(3)), vec![emit(VoiceEvent::SessionStarted { id: 3, app: String::new() })]);
     }
 
     #[test]
@@ -219,7 +221,7 @@ mod tests {
         p.handle(Input::Cancel);
         p.handle(Input::Start);
         assert_eq!(p.handle(Input::MicFailed(1, "busy".into())), vec![]);
-        assert_eq!(p.handle(Input::MicReady(2)), vec![emit(VoiceEvent::SessionStarted { id: 2 })]);
+        assert_eq!(p.handle(Input::MicReady(2)), vec![emit(VoiceEvent::SessionStarted { id: 2, app: String::new() })]);
         assert_eq!(p.handle(Input::MicReady(1)), vec![DropMic(1)], "while listening");
         p.handle(Input::Stop);
         assert_eq!(p.handle(Input::MicReady(1)), vec![DropMic(1)], "while transcribing");
@@ -234,7 +236,7 @@ mod tests {
         p.handle(Input::Start);
         assert_eq!(p.handle(Input::MicReady(1)), vec![DropMic(1)]);
         assert_eq!(p.phase(), Phase::Arming(2));
-        assert_eq!(p.handle(Input::MicReady(2)), vec![emit(VoiceEvent::SessionStarted { id: 2 })]);
+        assert_eq!(p.handle(Input::MicReady(2)), vec![emit(VoiceEvent::SessionStarted { id: 2, app: String::new() })]);
     }
 
     #[test]

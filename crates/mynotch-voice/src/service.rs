@@ -22,6 +22,9 @@ use crate::stt::{SttEngine, SttOptions, WhisperEngine};
 use crate::trigger::Signal;
 use crate::{Config, VoiceCommand, VoiceEvent};
 
+/// How often the microphone's level is reported while listening.
+const LEVEL_EVERY: Duration = Duration::from_millis(33);
+
 pub(crate) enum Msg {
     Command(VoiceCommand, Instant),
     Shutdown,
@@ -112,17 +115,20 @@ async fn run(config: Config, commands: UnboundedSender<Msg>, mut inbox: Unbounde
         pressed_at: Instant::now(),
         cap: None,
     };
+    // The microphone's level, for the notch's waveform, while listening.
+    let mut meter = tokio::time::interval(LEVEL_EVERY);
+    meter.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let msg = tokio::select! {
-            msg = inbox.recv() => msg,
+        tokio::select! {
+            msg = inbox.recv() => match msg {
+                None | Some(Msg::Shutdown) => break,
+                Some(msg) => driver.on(msg),
+            },
             () = tokio::time::sleep_until(driver.cap.unwrap_or_else(tokio::time::Instant::now)), if driver.cap.is_some() => {
                 warn!("a session reached the {MAX_SECONDS} s limit; transcribing what was heard");
-                Some(Msg::Command(VoiceCommand::Stop, Instant::now()))
+                driver.on(Msg::Command(VoiceCommand::Stop, Instant::now()));
             }
-        };
-        match msg {
-            None | Some(Msg::Shutdown) => break,
-            Some(msg) => driver.on(msg),
+            _ = meter.tick(), if driver.cap.is_some() => driver.send_level(),
         }
     }
     info!("voice stopped");
@@ -244,6 +250,15 @@ impl Driver {
         };
     }
 
+    /// Reports the listening session's microphone level.
+    fn send_level(&self) {
+        if let Phase::Listening(id) = self.pipeline.phase()
+            && let Some(Some(mic)) = self.mics.get(&id)
+        {
+            let _ = self.events.send(VoiceEvent::Level { id, rms: mic.level() });
+        }
+    }
+
     /// Runs `work` on the blocking pool and hands its result back to the pipeline, or
     /// `if_panicked` if it panicked, so a session never waits forever.
     fn blocking(&self, work: impl FnOnce() -> Msg + Send + 'static, if_panicked: Msg) {
@@ -314,9 +329,14 @@ impl Driver {
                     Msg::Pasted(id, Err("Couldn't paste".into())),
                 );
             }
-            Effect::Emit(event) => {
+            Effect::Emit(mut event) => {
+                if let VoiceEvent::SessionStarted { id, app } | VoiceEvent::Delivered { id, app } = &mut event
+                    && let Some(s) = self.sessions.get(id)
+                {
+                    app.clone_from(&s.target.app);
+                }
                 match &event {
-                    VoiceEvent::SessionStarted { id } => {
+                    VoiceEvent::SessionStarted { id, .. } => {
                         if let (Some(s), Some(mic)) = (self.sessions.get(id), self.mics.get(id)) {
                             let device = mic.as_ref().map_or("the fake microphone", |r| r.describe());
                             info!("session {id}: listening on {device} ({} ms after the press)", s.pressed.elapsed().as_millis());
@@ -330,10 +350,10 @@ impl Driver {
                         warn!("session {id}: failed: {error}");
                         self.sessions.remove(id);
                     }
-                    VoiceEvent::Delivered { id } => {
+                    VoiceEvent::Delivered { id, .. } => {
                         self.sessions.remove(id);
                     }
-                    VoiceEvent::Transcribing { .. } | VoiceEvent::Transcript { .. } => {}
+                    VoiceEvent::Level { .. } | VoiceEvent::Transcribing { .. } | VoiceEvent::Transcript { .. } => {}
                 }
                 let _ = self.events.send(event);
             }

@@ -32,13 +32,16 @@ pub const MODEL_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
 /// What a voice session is doing (plan §5.4, the events M0 has).
 #[derive(Clone, Debug, PartialEq)]
 pub enum VoiceEvent {
-    /// The microphone is open and listening.
-    SessionStarted { id: SessionId },
+    /// The microphone is open and listening. `app` is where the text will go ("Notepad"), or
+    /// empty if unknown.
+    SessionStarted { id: SessionId, app: String },
+    /// How loud the microphone is (RMS, 0..1), about 30 times a second while listening.
+    Level { id: SessionId, rms: f32 },
     /// The key came up; Whisper is working.
     Transcribing { id: SessionId },
     Transcript { id: SessionId, text: String },
-    /// Pasted at the cursor.
-    Delivered { id: SessionId },
+    /// Pasted at the cursor, into `app`.
+    Delivered { id: SessionId, app: String },
     /// A tap or a chord; nothing was pasted.
     Cancelled { id: SessionId },
     /// One line on what went wrong; nothing was pasted.
