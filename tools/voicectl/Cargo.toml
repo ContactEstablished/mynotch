@@ -1,0 +1,8 @@
+[package]
+name = "voicectl"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line tools for MyNotch Voice"
+
+[dependencies]
+mynotch-voice = { path = "../../crates/mynotch-voice" }

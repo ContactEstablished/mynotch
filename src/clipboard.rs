@@ -15,7 +15,7 @@ use windows::{
         System::{
             DataExchange::{
                 AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-                IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener,
+                GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener,
                 SetClipboardData,
             },
             LibraryLoader::GetModuleHandleW,
@@ -224,6 +224,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe {
                 let _ = KillTimer(Some(hwnd), CAPTURE_TIMER);
             }
+            // Voice is pasting: look again once it has put the user's clipboard back.
+            if mynotch_voice::is_clipboard_busy() {
+                unsafe { SetTimer(Some(hwnd), CAPTURE_TIMER, SETTLE_MS, None) };
+                return LRESULT(0);
+            }
             if let Some(content) = capture(hwnd) {
                 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
                 let clip = Clip { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), content, at: Instant::now() };
@@ -238,7 +243,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 fn capture(hwnd: HWND) -> Option<Content> {
     let _open = OpenGuard::new(hwnd)?;
     unsafe {
-        if is_private() {
+        // Voice putting the user's clipboard back after a paste isn't a new copy. (Read while
+        // the clipboard is open, so the number and the content go together.)
+        if is_private() || mynotch_voice::is_own_clipboard_restore(GetClipboardSequenceNumber()) {
             return None;
         }
         if IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT.0)).is_ok() {

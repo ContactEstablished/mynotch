@@ -1,0 +1,16 @@
+# whisper-rs-sys generates its bindings with bindgen, and the libclang it loads can't find
+# headers on this PC by itself:
+# - its own builtin headers (stdbool.h): it asks clang.exe for them, found through CLANG_PATH
+#   or PATH, and winget's LLVM doesn't put itself on PATH;
+# - the MSVC and Windows SDK headers (stdio.h): clang 23 doesn't discover Visual Studio 18, but
+#   follows VCToolsInstallDir as a Developer Prompt sets it.
+# VCToolsInstallDir names the MSVC version installed (this PC also has 14.44), so it needs
+# updating when Visual Studio updates its tools or on another machine. When it's wrong,
+# bindgen's "'stdio.h' file not found" is only a hidden warning: whisper-rs-sys falls back to
+# its bundled Linux bindings, and the build fails in whisper-rs-sys with "attempt to compute
+# `12_usize - 16_usize`, which would overflow" (their size checks). Changing these doesn't
+# rerun its build script by itself: `cargo clean -p whisper-rs-sys` does.
+# Variables already set in the environment (a Developer Prompt) win over these.
+[env]
+CLANG_PATH = "C:\\Program Files\\LLVM\\bin\\clang.exe"
+VCToolsInstallDir = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.51.36231\\"

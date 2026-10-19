@@ -42,6 +42,7 @@ use crate::settings::Settings;
 use crate::settings_panel::{self, Hit, PlaceRow, ShortcutRow};
 use crate::text::{self, Command, TextField, Utf16Joiner};
 use crate::theme::{motion as timing, space};
+use crate::voice::Voice;
 use crate::weather::Weather;
 use crate::widgets::{self, Compact, SearchAction, SearchKey, Widget};
 
@@ -379,6 +380,13 @@ enum Modal {
     PickColor,
 }
 
+/// Where the collapsed readout comes from: a widget (by index), or voice, which has no tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Widget(usize),
+    Voice,
+}
+
 /// Who holds the keyboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Owner {
@@ -448,6 +456,8 @@ struct App {
     place_field: Option<TextField>,
     /// Local weather, for the Time tab; the place comes from Settings.
     weather: Rc<Weather>,
+    /// Hold Right Ctrl to dictate; its readout shows in the rail.
+    voice: Voice,
     /// The widget showing search results (by index into `widgets`), while searching.
     results: Option<usize>,
     /// Pairs UTF-16 surrogates from WM_CHAR.
@@ -572,6 +582,7 @@ impl App {
                 search: None,
                 place_field: None,
                 weather,
+                voice: Voice::start(),
                 results: None,
                 joiner: Utf16Joiner::default(),
                 hotkey_taken: false,
@@ -1101,13 +1112,28 @@ impl App {
         true
     }
 
-    /// The collapsed readout, and the index of the widget providing it.
-    fn compact(&self) -> Option<(usize, Compact)> {
+    /// The collapsed readout, and where it comes from: voice while you dictate, else the
+    /// top-priority widget's.
+    fn compact(&self) -> Option<(Source, Compact)> {
+        let widget = self.widget_compact().map(|(i, c)| (Source::Widget(i), c));
+        self.voice.compact().map(|c| (Source::Voice, c)).into_iter().chain(widget).max_by_key(|(_, c)| c.priority)
+    }
+
+    /// The top-priority widget's readout, and the index of the widget providing it.
+    fn widget_compact(&self) -> Option<(usize, Compact)> {
         self.widgets
             .iter()
             .enumerate()
             .filter_map(|(i, w)| w.compact().map(|c| (i, c)))
             .max_by_key(|(_, c)| c.priority)
+    }
+
+    /// Whether the readout's source is moving by itself (its live dot breathes).
+    fn source_animating(&self, source: Source) -> bool {
+        match source {
+            Source::Widget(i) => self.widgets[i].animating(),
+            Source::Voice => self.voice.animating(),
+        }
     }
 
     /// Current notch size in physical pixels.
@@ -1137,6 +1163,10 @@ impl App {
         {
             self.settings.place = Some((query, Some(place)));
             self.settings.save();
+        }
+        // Voice: redraw when its readout in the rail changes.
+        if self.voice.poll(now) {
+            self.dirty = true;
         }
         if let Some(i) = self.widgets.iter_mut().position(|w| w.take_attention()) {
             // E.g. a focus session ended: pop open on that widget, with a chime.
@@ -1242,7 +1272,7 @@ impl App {
             // Opening from collapsed: Home if that's where the user left it (it shows the live
             // activity anyway); else live activity (music, a running timer) takes the stage;
             // else the tab the user last picked; else Home.
-            self.active = match (tab_named(&self.widgets, &self.settings.tab), self.compact()) {
+            self.active = match (tab_named(&self.widgets, &self.settings.tab), self.widget_compact()) {
                 (Some(HOME), _) => HOME,
                 (_, Some((i, c))) if c.live => i + 1,
                 (saved, _) => saved.unwrap_or(HOME),
@@ -1282,7 +1312,7 @@ impl App {
             return None;
         }
         if self.t < 0.5 {
-            return self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating()).then_some(2);
+            return self.compact().is_some_and(|(source, c)| c.live && self.source_animating(source)).then_some(2);
         }
         let moving = match self.active {
             _ if self.search.is_some() => false,
@@ -1497,7 +1527,7 @@ impl App {
             let body = canvas(left, None);
             body.glass(Rect::new(0.0, -RADIUS, nw / s, nh / s + RADIUS), RADIUS, e);
 
-            // Collapsed: the rail, with the clock and the top-priority widget's readout.
+            // Collapsed: the rail, with the clock and the top readout (voice, or a widget's).
             if e < 0.5 {
                 self.brushes.set_content_opacity(1.0 - e * 2.0);
                 self.draw_rail(&body, nw / s, nh / s);
@@ -1622,7 +1652,7 @@ impl App {
     }
 
     /// The collapsed notch: the time, the sky and the temperature on the left, the
-    /// top-priority widget's readout (a running timer, the song playing, CPU and RAM) on the
+    /// top readout (voice while dictating, a running timer, the song playing, CPU and RAM) on the
     /// right, and a hairline of progress along the bottom while a timer runs or a song plays.
     fn draw_rail(&self, cv: &Canvas, w: f32, h: f32) {
         let baseline = h / 2.0 + 5.0;
@@ -1639,12 +1669,12 @@ impl App {
             let degrees = format!("{:.0}°", report.temperature.round() + 0.0);
             x += 25.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 25.0, baseline, Align::Left);
         }
-        let Some((i, compact)) = self.compact() else { return };
+        let Some((source, compact)) = self.compact() else { return };
         cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
         let mut x = x + 18.0;
         if compact.live {
-            // It breathes while a timer or stopwatch runs.
-            let swell = if self.widgets[i].animating() && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
+            // It breathes while a timer or stopwatch runs, or voice is listening.
+            let swell = if self.source_animating(source) && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
             cv.halo(x + 2.5, h / 2.0, 2.0 + 1.5 * swell, Ink::Accent, 0.3 + 0.7 * swell);
             cv.circle(x + 2.5, h / 2.0, 2.5, Ink::Accent, None);
             x += 10.0;

@@ -1,0 +1,16 @@
+[package]
+name = "mynotch-voice"
+version = "0.1.0"
+edition = "2024"
+description = "MyNotch Voice: hold a key, talk, and the text is pasted at the cursor"
+
+[dependencies]
+cpal = "0.18.2"
+hound = "3.5.1"
+ringbuf = "0.5.3"
+rubato = "5.0.1"
+tokio = { version = "1.53.3", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
+whisper-rs = { version = "0.16.0", features = ["cuda", "raw-api", "tracing_backend"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Power", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

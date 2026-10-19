@@ -17,6 +17,7 @@ mod stats;
 mod text;
 mod theme;
 mod timer;
+mod voice;
 mod weather;
 mod widgets;
 
