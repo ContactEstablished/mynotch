@@ -6,31 +6,40 @@ mod apps;
 mod clipboard;
 mod clock;
 mod focus;
+mod gallery;
 mod media;
 mod sky;
 mod stopwatch;
+mod styles;
 mod system;
 mod time;
 
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::gfx::{Align, Canvas, Font, Ink, Rect};
+use crate::gfx::{Align, Canvas, Font, Ink, Rect, Rgb};
 use crate::motion;
-use crate::theme::{motion as timing, space};
+use crate::theme::{alpha, color, motion as timing, space};
 use crate::settings::Settings;
 use crate::weather::Weather;
 
 /// A round icon button. `primary` is lit cyan glass with a soft halo; others are bare icons
 /// that light up under the cursor. Disabled buttons are drawn faint and never highlight.
 fn button(cv: &Canvas, r: Rect, icon: &str, font: Font, enabled: bool, primary: bool) {
+    button_in(cv, r, icon, font, enabled, primary.then_some(color::CYAN));
+}
+
+/// `button`, primary when given an accent, which it's lit in instead of cyan.
+fn button_in(cv: &Canvas, r: Rect, icon: &str, font: Font, enabled: bool, accent: Option<Rgb>) {
     let hot = cv.hover_if(r, enabled);
     let (cx, cy, radius) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0);
-    if primary {
-        cv.circle(cx, cy, radius, Ink::Lit, None);
-        cv.circle_a(cx, cy, radius, Ink::Lit, None, hot);
-        cv.circle_a(cx, cy, radius - 0.5, Ink::LitEdge, Some(1.0), 0.8 + 0.2 * hot);
-        cv.halo(cx, cy, radius, Ink::Accent, 0.5 + 0.5 * hot);
+    let primary = accent.is_some();
+    if let Some(accent) = accent {
+        let ink = Ink::Rgb(accent);
+        cv.circle_a(cx, cy, radius, ink, None, alpha::LIT);
+        cv.circle_a(cx, cy, radius, ink, None, alpha::LIT * hot);
+        cv.circle_a(cx, cy, radius - 0.5, ink, Some(1.0), alpha::LIT_EDGE * (0.8 + 0.2 * hot));
+        cv.halo(cx, cy, radius, ink, 0.5 + 0.5 * hot);
     } else {
         cv.circle_a(cx, cy, radius, Ink::Hover, None, hot);
     }
@@ -243,6 +252,19 @@ pub trait Widget {
         false
     }
 
+    /// Draws the Home card itself at `r`, in Home's content coordinates: lit if it's the one
+    /// that matters most, with a light running round it while it's animating.
+    fn draw_card_frame(&self, cv: &Canvas, r: Rect) {
+        cv.card(r, space::CARD_RADIUS, if self.card_lit() { 0.6 } else { 0.0 });
+        if self.card_animating() {
+            running_edge(cv, r, Ink::Accent);
+        }
+    }
+
+    /// The panel stopped showing (the notch closed, or another tab was picked): drop any
+    /// passing view, such as a picker left open.
+    fn leave(&mut self) {}
+
     /// Draws the Home card's content area, of logical size `w` x `h`, at the canvas origin.
     fn draw_card(&self, _cv: &Canvas, _w: f32, _h: f32) {}
 
@@ -281,6 +303,7 @@ pub trait Widget {
 }
 
 pub use clock::{now_short, weather_icon};
+pub use styles::Style as TimerStyle;
 
 /// Every widget, in tab order. The Time tab shows `weather`.
 pub fn all(weather: &Rc<Weather>) -> Vec<Box<dyn Widget>> {

@@ -6,8 +6,10 @@ use std::time::Instant;
 
 use super::clock::Clock;
 use super::focus::Focus;
+use super::gallery::{self, Pick, Preview};
 use super::stopwatch::Stopwatch;
-use super::{Compact, Widget, running_edge};
+use super::styles::Face;
+use super::{Compact, Widget, button, running_edge};
 use crate::gfx::{Align, Canvas, Font, Ink, Rect, glyph};
 use crate::motion;
 use crate::settings::Settings;
@@ -34,6 +36,12 @@ fn inner(card: Rect) -> Rect {
     card.inset(space::CARD_PAD)
 }
 
+/// The Timer card's palette button, which opens the style gallery, in the top right corner
+/// of the card's content area (`w` wide).
+fn style_button(w: f32) -> Rect {
+    Rect::new(w - 18.0, -4.0, 22.0, 22.0)
+}
+
 /// A card's heading: an icon (or a dot, in `ink`) and an uppercase label.
 pub(super) fn header(cv: &Canvas, icon: Option<&str>, label: &str, ink: Ink, w: f32) {
     let row = Rect::new(0.0, 0.0, w, 14.0);
@@ -58,11 +66,37 @@ pub struct TimeWidget {
     stopwatch: Stopwatch,
     /// Content size at the last press, for following a drag.
     size: (f32, f32),
+    /// The timer style gallery is open, over the cards.
+    picking: bool,
 }
 
 impl TimeWidget {
     pub fn new(weather: Rc<Weather>) -> Self {
-        Self { focus: Focus::new(), clock: Clock::new(weather), stopwatch: Stopwatch::new(), size: (692.0, 146.0) }
+        Self {
+            focus: Focus::new(),
+            clock: Clock::new(weather),
+            stopwatch: Stopwatch::new(),
+            size: (692.0, 146.0),
+            picking: false,
+        }
+    }
+
+    fn draw_gallery(&self, cv: &Canvas, w: f32, h: f32) {
+        let (time, left, running) = self.focus.preview(Instant::now());
+        let preview = Preview { face: Face { time: &time, flip: None, running }, left };
+        gallery::draw(cv, w, h, self.focus.style(), &preview);
+    }
+
+    fn click_gallery(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        match gallery::hit(x, y, w, h) {
+            Some(Pick::Style(style)) => {
+                self.focus.set_style(style);
+                self.picking = false;
+            }
+            Some(Pick::Close) => self.picking = false,
+            None => return false,
+        }
+        true
     }
 }
 
@@ -85,16 +119,22 @@ impl Widget for TimeWidget {
     }
 
     fn draw(&self, cv: &Canvas, w: f32, h: f32) {
+        if self.picking {
+            self.draw_gallery(cv, w, h);
+            return;
+        }
         let [focus, clock, stopwatch] = cards(w, h);
-        // The timer is the one that matters: lit always, brighter while it runs. The
-        // stopwatch lights up while it runs. Running ones get a light round their edge.
+        // The timer is the one that matters: lit always (in its style's colour), brighter
+        // while it runs. The stopwatch lights up while it runs. Running ones get a light
+        // round their edge.
+        let style = self.focus.style();
         let lit = cv.ease(motion::key("focus-card"), if self.focus.running() { 1.0 } else { 0.6 }, timing::STATE);
         let ticking = cv.ease(motion::key("stopwatch-card"), f32::from(u8::from(self.stopwatch.is_running())), timing::STATE);
-        cv.card(focus, space::CARD_RADIUS, lit);
+        cv.card_in(focus, space::CARD_RADIUS, lit, style.accent());
         cv.card(clock, space::CARD_RADIUS, 0.0);
         cv.card(stopwatch, space::CARD_RADIUS, 0.6 * ticking);
         if self.focus.running() {
-            running_edge(cv, focus, Ink::Accent);
+            style.edge(cv, focus);
         }
         if self.stopwatch.is_running() {
             running_edge(cv, stopwatch, Ink::Accent);
@@ -105,6 +145,7 @@ impl Widget for TimeWidget {
         };
         let (c, w0, h0) = at(focus);
         self.focus.draw(&c, w0, h0);
+        button(&c, style_button(w0), glyph::PALETTE, Font::IconCaption, true, false);
         let (c, w1, h1) = at(clock);
         self.clock.draw(&c, w1, h1);
         let (c, w2, h2) = at(stopwatch);
@@ -112,9 +153,15 @@ impl Widget for TimeWidget {
     }
 
     fn click(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        if self.picking {
+            return self.click_gallery(x, y, w, h);
+        }
         let [focus, _, stopwatch] = cards(w, h).map(inner);
         let local = |r: Rect| (x - r.x, y - r.y);
-        if focus.contains(x, y) {
+        if style_button(focus.w).contains(x - focus.x, y - focus.y) {
+            self.picking = true;
+            true
+        } else if focus.contains(x, y) {
             let (x, y) = local(focus);
             self.focus.click(x, y, focus.w, focus.h)
         } else if stopwatch.contains(x, y) {
@@ -126,6 +173,9 @@ impl Widget for TimeWidget {
     }
 
     fn press(&mut self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        if self.picking {
+            return false;
+        }
         self.size = (w, h);
         let focus = inner(cards(w, h)[0]);
         self.focus.press(x - focus.x, y - focus.y, focus.w, focus.h)
@@ -154,6 +204,18 @@ impl Widget for TimeWidget {
 
     fn card_lit(&self) -> bool {
         true
+    }
+
+    fn draw_card_frame(&self, cv: &Canvas, r: Rect) {
+        let style = self.focus.style();
+        cv.card_in(r, space::CARD_RADIUS, 0.6, style.accent());
+        if self.focus.running() {
+            style.edge(cv, r);
+        }
+    }
+
+    fn leave(&mut self) {
+        self.picking = false;
     }
 
     fn animating(&self) -> bool {

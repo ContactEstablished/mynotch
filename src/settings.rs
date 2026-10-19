@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::hotkey::Hotkey;
 use crate::weather::Place;
+use crate::widgets::TimerStyle;
 
 /// The default body colour, the Halo glass tint (`theme::color::GLASS`), as `0xRRGGBB`.
 pub const DEFAULT_COLOR: u32 = crate::theme::color::GLASS.hex();
@@ -27,6 +28,8 @@ pub struct Settings {
     pub tab: String,
     /// Length of a focus session (1..=180).
     pub focus_minutes: u32,
+    /// How the timer looks.
+    pub timer_style: TimerStyle,
     /// Apps pinned in the Apps tab, by shell id, in order. `None` until first chosen, so the
     /// tab can suggest some on first run.
     pub apps: Option<Vec<String>>,
@@ -50,6 +53,7 @@ impl Default for Settings {
             hide_in_fullscreen: true,
             tab: String::new(),
             focus_minutes: 25,
+            timer_style: TimerStyle::default(),
             apps: None,
             color: DEFAULT_COLOR,
             opacity: DEFAULT_OPACITY,
@@ -99,6 +103,8 @@ impl Settings {
                         s.focus_minutes = m.clamp(1, 180);
                     }
                 }
+                // A style this version doesn't know falls back to the default.
+                "timer_style" => s.timer_style = TimerStyle::from_key(value).unwrap_or_default(),
                 // '|' can't appear in a path or an AppUserModelID.
                 "apps" => s.apps = Some(value.split('|').filter(|id| !id.is_empty()).map(String::from).collect()),
                 "color" => {
@@ -169,6 +175,7 @@ impl Settings {
                 text += &format!("place_name={}\nplace_lat={}\nplace_lon={}\n", p.name, p.lat, p.lon);
             }
         }
+        text += &format!("timer_style={}\n", self.timer_style.key());
         text += &format!("style={STYLE}\n");
         text
     }
@@ -183,6 +190,7 @@ mod tests {
     use super::Settings;
     use crate::weather::Place;
     use crate::hotkey::Hotkey;
+    use crate::widgets::TimerStyle;
 
     #[test]
     fn round_trips() {
@@ -191,6 +199,7 @@ mod tests {
             hide_in_fullscreen: false,
             tab: "System".into(),
             focus_minutes: 50,
+            timer_style: TimerStyle::Retro,
             apps: None,
             color: 0x14284A,
             opacity: 65,
@@ -229,6 +238,7 @@ mod tests {
         );
         assert_eq!(s, Settings { pinned: true, ..Settings::default() });
         assert_eq!(Settings::parse("color=1000000").color, Settings::default().color, "more than 24 bits");
+        assert_eq!(Settings::parse("timer_style=plaid").timer_style, TimerStyle::default(), "a style from the future");
     }
 
     #[test]

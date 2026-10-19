@@ -3,11 +3,12 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use super::{Compact, button, button_row, clock, pulse, pulsing, slider, slider_at, slider_hit};
+use super::styles::{Dial, Face, Size, Style};
+use super::{Compact, button, button_in, button_row, clock, pulse, pulsing, slider, slider_at, slider_hit};
 use crate::gfx::{Align, Canvas, Font, Ink, Rect, glyph};
 use crate::motion;
 use crate::settings::Settings;
-use crate::theme::{motion as timing, space};
+use crate::theme::{alpha, motion as timing, space};
 use crate::timer::Timer;
 
 /// Timer lengths offered as chips, in minutes.
@@ -29,8 +30,8 @@ const SMALL_BUTTON: f32 = 22.0;
 /// Where the time sits (its baseline), on the card and on Home.
 const BASELINE: f32 = 46.0;
 const CARD_BASELINE: f32 = 47.0;
-/// How long the glow at the ring's moving end takes to swell and fade.
-const BREATH: f32 = 2.4;
+/// How full the gallery's rings are drawn while the timer is stopped, to show them off.
+const PREVIEW_LEFT: f32 = 0.7;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Control {
@@ -42,6 +43,7 @@ enum Control {
 /// (as chips and a slider) while it's stopped.
 pub struct Focus {
     timer: Timer,
+    style: Style,
     /// Whole seconds last drawn, so a running timer redraws once per second.
     shown_secs: u64,
     attention: bool,
@@ -57,6 +59,7 @@ impl Focus {
     pub fn new() -> Self {
         Self {
             timer: Timer::new(minutes(25)),
+            style: Style::default(),
             shown_secs: u64::MAX,
             attention: false,
             done: false,
@@ -67,6 +70,36 @@ impl Focus {
 
     pub fn running(&self) -> bool {
         self.timer.is_running()
+    }
+
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
+    /// Returns true when it changed.
+    pub fn set_style(&mut self, style: Style) -> bool {
+        std::mem::replace(&mut self.style, style) != style
+    }
+
+    /// While a Retro Clock timer runs: the time shown a second before, and how far (0..1)
+    /// its digits have flipped over since the time changed.
+    fn flip(&self, now: Instant) -> Option<(String, f32)> {
+        if self.style != Style::Retro || !self.timer.is_running() || motion::reduced() {
+            return None;
+        }
+        let shown = self.remaining(now).as_secs();
+        // The time shown changed when the time left fell to a whole second.
+        let since = shown as f32 - self.timer.remaining(now).as_secs_f32();
+        let t = since / timing::FLIP.as_secs_f32();
+        let before = shown + 1;
+        (t < 1.0 && before <= self.timer.length().as_secs()).then(|| (clock(Duration::from_secs(before)), t.max(0.0)))
+    }
+
+    /// The timer as the style gallery's tiles show it; stopped, their rings are part full
+    /// to show them off.
+    pub fn preview(&self, now: Instant) -> (String, f32, bool) {
+        let left = if self.timer.is_idle() { PREVIEW_LEFT } else { self.left(now) };
+        (clock(self.remaining(now)), left, self.timer.is_running())
     }
 
     /// Remaining time, rounded up to whole seconds (so it reads 25:00, not 24:59, at start).
@@ -157,29 +190,28 @@ impl Focus {
         }
     }
 
-    /// The ring: time left as a lit arc around the start/pause button, glowing softly. While
-    /// it runs, the arc's moving end carries a bright point that breathes.
+    /// The time, in the timer's style, from (0, `baseline`).
+    fn draw_time(&self, cv: &Canvas, baseline: f32, now: Instant) {
+        let time = clock(self.remaining(now));
+        let flip = self.flip(now);
+        let face = Face { time: &time, flip: flip.as_ref().map(|(was, t)| (was.as_str(), *t)), running: self.running() };
+        self.style.time(cv, &face, 0.0, baseline, Size::Card);
+    }
+
+    /// The ring: time left around the start/pause button, in the timer's style.
     fn draw_ring(&self, cv: &Canvas, toggle: Rect, now: Instant) {
         let (cx, cy) = (toggle.x + toggle.w / 2.0, toggle.y + toggle.h / 2.0);
         let hot = cv.hover(toggle);
         let on = cv.ease(motion::key(("ring", cx as i32)), if self.paused() { 0.55 } else { 1.0 }, timing::STATE);
-        let left = self.left(now);
-        cv.circle(cx, cy, RING_R, Ink::Line, Some(RING_W));
-        cv.halo(cx, cy, RING_R, Ink::Accent, (0.55 + 0.45 * hot) * on);
-        cv.ring(cx, cy, RING_R, RING_W, left, None, on);
-        if self.timer.is_running() {
-            let (sin, cos) = (left * std::f32::consts::TAU).sin_cos();
-            let (hx, hy) = (cx + RING_R * sin, cy - RING_R * cos);
-            let swell = if motion::reduced() { 0.6 } else { motion::breath(BREATH) };
-            cv.halo(hx, hy, 2.5 + 1.5 * swell, Ink::Accent, 0.35 + 0.65 * swell);
-            cv.circle(hx, hy, 2.4, Ink::Text, None);
-        }
-        pulse(cv, cx, cy, RING_R, Ink::Accent, self.started);
-        // The button inside.
+        let dial = Dial { cx, cy, r: RING_R, width: RING_W, left: self.left(now), running: self.running(), hot, on };
+        self.style.ring(cv, &dial);
+        let accent = Ink::Rgb(self.style.accent());
+        pulse(cv, cx, cy, RING_R, accent, self.started);
+        // The button inside, in the style's colour.
         let inner = RING_R - 7.0;
-        cv.circle(cx, cy, inner, Ink::Lit, None);
-        cv.circle_a(cx, cy, inner, Ink::Lit, None, hot);
-        cv.circle_a(cx, cy, inner - 0.5, Ink::LitEdge, Some(1.0), 0.7 + 0.3 * hot);
+        cv.circle_a(cx, cy, inner, accent, None, alpha::LIT);
+        cv.circle_a(cx, cy, inner, accent, None, alpha::LIT * hot);
+        cv.circle_a(cx, cy, inner - 0.5, accent, Some(1.0), alpha::LIT_EDGE * (0.7 + 0.3 * hot));
         let icon = if self.timer.is_running() { glyph::PAUSE } else { glyph::PLAY };
         cv.text(icon, Font::IconMedium, Ink::Text, toggle, Align::Center);
     }
@@ -187,12 +219,11 @@ impl Focus {
     pub fn draw(&self, cv: &Canvas, w: f32, h: f32) {
         let now = Instant::now();
         self.was_pulsing.set(pulsing(self.started));
-        super::time::header(cv, None, "Timer", Ink::Accent, w);
+        super::time::header(cv, None, "Timer", Ink::Rgb(self.style.accent()), w);
 
-        let time = clock(self.remaining(now));
-        cv.numerals(&[(time.as_str(), Font::Timer, Ink::Text)], 0.0, BASELINE, Align::Left);
+        self.draw_time(cv, BASELINE, now);
         let status = Rect::new(0.0, 51.0, w - RING_IN - RING_R - 6.0, 18.0);
-        cv.text(&self.status(now), Font::Small, Ink::Dim, status, Align::Left);
+        self.style.status(cv, &self.status(now), status);
 
         for (control, r) in controls(w) {
             match control {
@@ -252,10 +283,12 @@ impl Focus {
 
     pub fn load(&mut self, settings: &Settings) {
         self.timer.set_length(minutes(settings.focus_minutes));
+        self.style = settings.timer_style;
     }
 
     pub fn store(&self, settings: &mut Settings) {
         settings.focus_minutes = self.length_minutes();
+        settings.timer_style = self.style;
     }
 
     pub fn take_attention(&mut self) -> bool {
@@ -265,24 +298,18 @@ impl Focus {
     pub fn draw_card(&self, cv: &Canvas, w: f32, h: f32) {
         let now = Instant::now();
         self.was_pulsing.set(pulsing(self.started));
-        super::time::header(cv, None, "Timer", Ink::Accent, w);
-        cv.numerals(&[(clock(self.remaining(now)).as_str(), Font::Timer, Ink::Text)], 0.0, CARD_BASELINE, Align::Left);
-        cv.text(&self.status(now), Font::Small, Ink::Dim, Rect::new(0.0, 51.0, w, 18.0), Align::Left);
-        // A thin bar of the time left, its end breathing while it runs.
-        let bar = Rect::new(0.0, 76.0, w, 2.0);
-        let left = self.left(now);
-        cv.fill(bar, 1.0, Ink::Line);
-        cv.fill(Rect { w: (bar.w * left).max(bar.h), ..bar }, 1.0, Ink::Accent);
-        if self.timer.is_running() {
-            let swell = if motion::reduced() { 0.6 } else { motion::breath(BREATH) };
-            cv.halo(bar.w * left, bar.y + 1.0, 2.0 + swell, Ink::Accent, 0.35 + 0.65 * swell);
-        }
+        let accent = self.style.accent();
+        super::time::header(cv, None, "Timer", Ink::Rgb(accent), w);
+        self.draw_time(cv, CARD_BASELINE, now);
+        self.style.status(cv, &self.status(now), Rect::new(0.0, 51.0, w, 18.0));
+        // A thin bar of the time left, in the timer's style.
+        self.style.bar(cv, Rect::new(0.0, 76.0, w, 2.0), self.left(now), self.running());
         for (control, r) in card_controls(w, h) {
             match control {
                 Control::Toggle => {
                     let icon = if self.timer.is_running() { glyph::PAUSE } else { glyph::PLAY };
-                    pulse(cv, r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, Ink::Accent, self.started);
-                    button(cv, r, icon, Font::Icon, true, true);
+                    pulse(cv, r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, Ink::Rgb(accent), self.started);
+                    button_in(cv, r, icon, Font::Icon, true, Some(accent));
                 }
                 Control::Reset => {
                     let enabled = !self.timer.is_idle() || self.done;

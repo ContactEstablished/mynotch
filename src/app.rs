@@ -96,7 +96,6 @@ const CONTENT: Rect = Rect::new(PAD, CONTENT_Y, EXPANDED.0 - PAD * 2.0, EXPANDED
 // Home dashboard cards.
 const CARD_GAP: f32 = space::GAP;
 const CARD_PAD: f32 = space::CARD_PAD;
-const CARD_RADIUS: f32 = space::CARD_RADIUS;
 /// A slide that ends this close to the middle of the screen snaps to it.
 const SNAP: f32 = 12.0;
 /// Longest search query, in chars.
@@ -640,6 +639,9 @@ impl App {
 
     fn select_tab(&mut self, i: usize) {
         if i != self.active {
+            if let Some(w) = self.active.checked_sub(1).and_then(|k| self.widgets.get_mut(k)) {
+                w.leave();
+            }
             self.active = i;
             // Settings is never reopened by itself, so isn't remembered.
             if i != settings_tab(&self.widgets) {
@@ -1251,6 +1253,12 @@ impl App {
         if self.t != target {
             self.t = if motion::reduced() { target } else { approach(self.t, target, ANIMATION_STEP) };
             self.dirty = true;
+            if self.t == 0.0 {
+                // Closed: the panels drop anything left open in passing.
+                for w in &mut self.widgets {
+                    w.leave();
+                }
+            }
         }
         // Something moving on screen gets its frames: every tick for the light running round a
         // card, every other one for the rail's breathing dot.
@@ -1514,10 +1522,7 @@ impl App {
                     }
                 } else if self.active == HOME {
                     for (i, r) in home_cards(&self.widgets) {
-                        content.card(r, CARD_RADIUS, if self.widgets[i].card_lit() { 0.6 } else { 0.0 });
-                        if self.widgets[i].card_animating() {
-                            widgets::running_edge(&content, r, Ink::Accent);
-                        }
+                        self.widgets[i].draw_card_frame(&content, r);
                         let inner = content.offset(r.x + CARD_PAD, r.y + CARD_PAD);
                         self.widgets[i].draw_card(&inner, r.w - CARD_PAD * 2.0, r.h - CARD_PAD * 2.0);
                     }

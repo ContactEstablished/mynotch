@@ -286,6 +286,9 @@ pub struct Brushes {
     catch: ID2D1LinearGradientBrush,
     /// Round caps, for arcs and glowing lines.
     round: ID2D1StrokeStyle,
+    /// Gradients through colours other than the sweep's (the timer styles'), made on first
+    /// use and keyed by their colours.
+    gradients: RefCell<HashMap<Vec<u32>, ID2D1LinearGradientBrush>>,
     glass: Glass,
     /// Last value given to `set_content_opacity`, applied to images too.
     content_opacity: Cell<f32>,
@@ -326,6 +329,7 @@ impl Brushes {
                 )?,
                 catch: linear(rt, &[(0.0, WHITE.with_alpha(0.16)), (1.0, WHITE.with_alpha(0.0))])?,
                 round: rt.GetFactory()?.CreateStrokeStyle(&caps, None)?,
+                gradients: RefCell::default(),
                 glass: Glass::new(rt, look)?,
                 content_opacity: Cell::new(1.0),
             })
@@ -439,6 +443,12 @@ pub enum Font {
     Fraction,
     /// Rajdhani 500, 15px: the collapsed rail and the session counter.
     Numeral,
+    /// Cascadia Mono (or Consolas), 26px: the Terminal timer style's time.
+    MonoTimer,
+    /// The same, 17px, in the style gallery.
+    MonoTile,
+    /// The same, 12px: the Terminal style's status line and progress bar.
+    MonoSmall,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -446,11 +456,12 @@ enum Family {
     Ui,
     Icons,
     Numerals,
+    Mono,
 }
 
 impl Font {
     /// In declaration order, so `font as usize` indexes it.
-    const ALL: [Font; 16] = [
+    const ALL: [Font; 19] = [
         Font::Small,
         Font::Caption,
         Font::Label,
@@ -467,6 +478,9 @@ impl Font {
         Font::Stopwatch,
         Font::Fraction,
         Font::Numeral,
+        Font::MonoTimer,
+        Font::MonoTile,
+        Font::MonoSmall,
     ];
 
     fn spec(self) -> (Family, f32, DWRITE_FONT_WEIGHT) {
@@ -489,6 +503,9 @@ impl Font {
             Font::Stopwatch => (Numerals, type_size::STOPWATCH, DWRITE_FONT_WEIGHT_MEDIUM),
             Font::Fraction => (Numerals, type_size::FRACTION, DWRITE_FONT_WEIGHT_MEDIUM),
             Font::Numeral => (Numerals, type_size::NUMERAL, DWRITE_FONT_WEIGHT_MEDIUM),
+            Font::MonoTimer => (Mono, type_size::MONO, normal),
+            Font::MonoTile => (Mono, type_size::MONO_TILE, normal),
+            Font::MonoSmall => (Mono, 12.0, normal),
         }
     }
 }
@@ -581,6 +598,9 @@ impl Fonts {
         let ui = if system_has(dwrite, &variable) { variable } else { HSTRING::from("Segoe UI") };
         let fluent = HSTRING::from("Segoe Fluent Icons");
         let icons = if system_has(dwrite, &fluent) { fluent } else { HSTRING::from("Segoe MDL2 Assets") };
+        // Cascadia Mono ships with Windows 11; Consolas with every version since Vista.
+        let cascadia = HSTRING::from("Cascadia Mono");
+        let mono = if system_has(dwrite, &cascadia) { cascadia } else { HSTRING::from("Consolas") };
         let formats = Font::ALL
             .iter()
             .map(|&font| {
@@ -588,6 +608,7 @@ impl Fonts {
                 let (name, collection, weight) = match (family, numerals) {
                     (Family::Ui, _) => (&ui, None, weight),
                     (Family::Icons, _) => (&icons, None, weight),
+                    (Family::Mono, _) => (&mono, None, weight),
                     (Family::Numerals, Some(n)) => (&n.family, Some(&n.collection), weight),
                     // Without the bundled face, a light UI face keeps big numbers airy.
                     (Family::Numerals, None) => (&ui, None, DWRITE_FONT_WEIGHT_SEMI_LIGHT),
@@ -876,6 +897,14 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// One line of text from `x`, standing on a baseline `baseline` px from the top. (In a
+    /// monospaced font this sets digits just as `numerals` does, in one call.)
+    pub fn text_at(&self, s: &str, font: Font, ink: Ink, x: f32, baseline: f32) {
+        let (base, height) = self.fonts.line(font);
+        let w = self.measure(s, font) + 4.0;
+        self.text(s, font, ink, Rect::new(x, baseline - base, w, height), Align::Left);
+    }
+
     /// Width of `s` set on one line in `font`.
     pub fn measure(&self, s: &str, font: Font) -> f32 {
         self.fonts.width(s, font)
@@ -965,23 +994,89 @@ impl<'a> Canvas<'a> {
     /// turn, in `ink`, or in the cyan-to-violet sweep for `None`; `a` scales its opacity.
     #[allow(clippy::too_many_arguments)]
     pub fn ring(&self, cx: f32, cy: f32, radius: f32, width: f32, fraction: f32, ink: Option<Ink>, a: f32) {
+        let brush: &ID2D1Brush = match ink {
+            Some(ink) => self.brushes.get(ink),
+            None => {
+                let sweep = &self.brushes.sweep;
+                self.diagonal(sweep, cx, cy, radius);
+                sweep
+            }
+        };
+        self.arc(cx, cy, radius, width, fraction, brush, a);
+    }
+
+    /// `ring` in a gradient through `colors`, from its top left to its bottom right.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ring_gradient(&self, cx: f32, cy: f32, radius: f32, width: f32, fraction: f32, colors: &[Rgb], a: f32) {
+        if let Some(brush) = self.gradient(colors) {
+            self.diagonal(&brush, cx, cy, radius);
+            self.arc(cx, cy, radius, width, fraction, &brush, a);
+        }
+    }
+
+    /// Lays `brush` across a circle's bounds, from its top left to its bottom right.
+    fn diagonal(&self, brush: &ID2D1LinearGradientBrush, cx: f32, cy: f32, radius: f32) {
+        let (c, r) = (self.point(cx, cy), radius * self.scale);
+        unsafe {
+            brush.SetStartPoint(Vector2 { X: c.X - r, Y: c.Y - r });
+            brush.SetEndPoint(Vector2 { X: c.X + r, Y: c.Y + r });
+        }
+    }
+
+    /// A linear gradient through `colors`, evenly spaced; each set is made once.
+    fn gradient(&self, colors: &[Rgb]) -> Option<ID2D1LinearGradientBrush> {
+        let key: Vec<u32> = colors.iter().map(|c| c.hex()).collect();
+        if let Some(brush) = self.brushes.gradients.borrow().get(&key) {
+            return Some(brush.clone());
+        }
+        let last = colors.len().saturating_sub(1).max(1) as f32;
+        let stops: Vec<_> = colors.iter().enumerate().map(|(i, c)| (i as f32 / last, c.with_alpha(1.0))).collect();
+        let brush = unsafe { linear(self.rt, &stops) }.ok()?;
+        self.brushes.gradients.borrow_mut().insert(key, brush.clone());
+        Some(brush)
+    }
+
+    /// `fill` in a gradient through `colors`, running from x = `from` to x = `to` (so a
+    /// progress bar's colour at its end follows where the end is).
+    pub fn fill_gradient(&self, r: Rect, radius: f32, colors: &[Rgb], (from, to): (f32, f32), a: f32) {
+        let Some(brush) = self.gradient(colors).filter(|_| a > 0.0) else { return };
+        let (start, end) = (self.point(from, r.y), self.point(to, r.y));
+        unsafe {
+            brush.SetStartPoint(start);
+            brush.SetEndPoint(end);
+        }
+        let rr = self.rounded(r, radius);
+        self.brushes.faded(&brush, a, || unsafe { self.rt.FillRoundedRectangle(&rr, &brush) });
+    }
+
+    /// Runs `draw` with `ink` at a fraction `a` of its opacity, for drawing that doesn't take
+    /// one (e.g. `numerals`). Everything `draw` paints should be in `ink`.
+    pub fn faded(&self, ink: Ink, a: f32, draw: impl FnOnce()) {
+        if a > 0.0 {
+            self.brushes.faded(self.brushes.get(ink), a, draw);
+        }
+    }
+
+    /// Runs `draw` squashed vertically by `k` (1 = as drawn, 0 = flat) towards the line
+    /// y = `y`: a flap seen turning on a hinge there.
+    pub fn squashed(&self, y: f32, k: f32, draw: impl FnOnce()) {
+        let mut old = Matrix3x2::identity();
+        unsafe { self.rt.GetTransform(&mut old) };
+        let hinge = Matrix3x2::scale_around(1.0, k.max(0.001), self.point(0.0, y));
+        unsafe { self.rt.SetTransform(&(hinge * old)) };
+        draw();
+        unsafe { self.rt.SetTransform(&old) };
+    }
+
+    /// The stroke of `ring`, in `brush`.
+    #[allow(clippy::too_many_arguments)]
+    fn arc(&self, cx: f32, cy: f32, radius: f32, width: f32, fraction: f32, brush: &ID2D1Brush, a: f32) {
         let f = fraction.clamp(0.0, 1.0);
         if f <= 0.0 || a <= 0.0 {
             return;
         }
         let s = self.scale;
         let (c, r) = (self.point(cx, cy), radius * s);
-        let brush: &ID2D1Brush = match ink {
-            Some(ink) => self.brushes.get(ink),
-            None => {
-                let sweep = &self.brushes.sweep;
-                unsafe {
-                    sweep.SetStartPoint(Vector2 { X: c.X - r, Y: c.Y - r });
-                    sweep.SetEndPoint(Vector2 { X: c.X + r, Y: c.Y + r });
-                }
-                sweep
-            }
-        };
         self.brushes.faded(brush, a, || unsafe {
             if f >= 0.999 {
                 let e = D2D1_ELLIPSE { point: c, radiusX: r, radiusY: r };
@@ -1151,13 +1246,18 @@ impl<'a> Canvas<'a> {
     /// catches the light along its top. `lit` (0..=1) edges it in cyan with a soft glow, for
     /// the card that matters most.
     pub fn card(&self, r: Rect, radius: f32, lit: f32) {
+        self.card_in(r, radius, lit, color::CYAN);
+    }
+
+    /// `card`, lit in `accent` instead of cyan.
+    pub fn card_in(&self, r: Rect, radius: f32, lit: f32, accent: Rgb) {
         let rr = self.rounded(r, radius);
         let px = rr.rect;
         unsafe {
             self.rt.FillRoundedRectangle(&rr, &self.brushes.shade);
         }
         self.fill_a(r, radius, Ink::Track, alpha::CARD_WASH / alpha::TRACK);
-        self.fill_a(r, radius, Ink::Lit, 0.4 * lit);
+        self.fill_a(r, radius, Ink::Rgb(accent), alpha::LIT * 0.4 * lit);
         self.outline(r, radius, Ink::Line, 1.0);
         let catch = &self.brushes.catch;
         unsafe {
@@ -1172,10 +1272,10 @@ impl<'a> Canvas<'a> {
             self.rt.DrawRoundedRectangle(&edge, catch, self.scale, None);
         }
         if lit > 0.0 {
-            self.outline(r, radius, Ink::LitEdge, 0.75 * lit);
+            self.outline(r, radius, Ink::Rgb(accent), alpha::LIT_EDGE * 0.75 * lit);
             for (grow, width, a) in [(1.5, 2.0, 0.10), (3.5, 3.0, 0.04)] {
                 let glow = self.rounded(r.inset(-grow), radius + grow);
-                let brush = self.brushes.get(Ink::Accent);
+                let brush = self.brushes.get(Ink::Rgb(accent));
                 self.brushes.faded(brush, a * lit, || unsafe {
                     self.rt.DrawRoundedRectangle(&glow, brush, width * self.scale, None);
                 });

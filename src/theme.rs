@@ -29,6 +29,37 @@ pub mod color {
     pub const SHADOW: Rgb = Rgb::from_hex(0x01050A);
 }
 
+/// The timer styles' own colours (see `widgets::styles`). Halo uses the main palette.
+pub mod styles {
+    use super::Rgb;
+
+    /// Pixel: hot pink blocks with a violet drop shadow, and a yellow block that blinks.
+    pub const PIXEL: Rgb = Rgb::from_hex(0xFF7AC6);
+    pub const PIXEL_SHADOW: Rgb = Rgb::from_hex(0x6A4BDB);
+    pub const PIXEL_BLINK: Rgb = Rgb::from_hex(0xFFE45E);
+    /// Dusk: a cream on a sunset running from amber through coral to violet.
+    pub const DUSK_TEXT: Rgb = Rgb::from_hex(0xFFE6D0);
+    pub const DUSK_DIM: Rgb = Rgb::from_hex(0xE2C2AE);
+    pub const DUSK: [Rgb; 3] = [Rgb::from_hex(0xFFB869), Rgb::from_hex(0xFF7A8A), Rgb::from_hex(0xB39BFF)];
+    /// Dots: lilac-white LEDs, and the violet of the edge lighting.
+    pub const DOTS_TEXT: Rgb = Rgb::from_hex(0xECE7FF);
+    pub const DOTS: Rgb = Rgb::from_hex(0xB3A2FB);
+    /// Retro Clock: cream digits on charcoal flip tiles, and an amber dial.
+    pub const RETRO: Rgb = Rgb::from_hex(0xFFB347);
+    pub const RETRO_TEXT: Rgb = Rgb::from_hex(0xF4EAD5);
+    pub const RETRO_TILE: Rgb = Rgb::from_hex(0x1B1E24);
+    /// Terminal: phosphor green.
+    pub const TERMINAL: Rgb = Rgb::from_hex(0x6CFF9A);
+    pub const TERMINAL_DIM: Rgb = Rgb::from_hex(0x45B86C);
+    /// Zen: sage, and a softer white.
+    pub const ZEN: Rgb = Rgb::from_hex(0xA8E6CF);
+    pub const ZEN_TEXT: Rgb = Rgb::from_hex(0xD8E6EE);
+    /// Cyber HUD: electric cyan, marked in magenta.
+    pub const HUD: Rgb = Rgb::from_hex(0x5CF2FF);
+    pub const HUD_DIM: Rgb = Rgb::from_hex(0x7FC9D6);
+    pub const HUD_MARK: Rgb = Rgb::from_hex(0xFF5CD6);
+}
+
 /// Opacities (0..=1) of the translucent inks.
 pub mod alpha {
     /// White fills of controls at rest: chips, idle buttons, tracks.
@@ -60,6 +91,9 @@ pub mod text {
     pub const FRACTION: f32 = 20.0;
     /// Small numerals: the collapsed rail.
     pub const NUMERAL: f32 = 15.0;
+    /// The Terminal timer style's monospaced time, on a card and in the style gallery.
+    pub const MONO: f32 = 26.0;
+    pub const MONO_TILE: f32 = 17.0;
     /// Buttons, chips and the active tab's name.
     pub const CONTROL: f32 = 12.5;
     /// Uppercase section labels.
@@ -91,4 +125,6 @@ pub mod motion {
     pub const STATE: Duration = Duration::from_millis(190);
     /// The one soft pulse when a timer starts.
     pub const PULSE: Duration = Duration::from_millis(700);
+    /// A Retro Clock digit flipping over.
+    pub const FLIP: Duration = Duration::from_millis(340);
 }
