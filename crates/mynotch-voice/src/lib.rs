@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 pub use logging::log_to_stderr;
 pub use pipeline::SessionId;
+/// Tags every key MyNotch injects (in `dwExtraInfo`), so the dictation hook lets it by. Other
+/// parts of MyNotch that inject keys (keep awake's F15 tap) use it too.
+pub use platform::win::input::MARKER as INPUT_MARKER;
 
 /// A hold shorter than this is a tap, which starts nothing. A UI can wait this long before
 /// showing a session, so taps and chords (Right Ctrl+C) don't flash it.

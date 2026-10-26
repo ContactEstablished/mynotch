@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::awake::Length as AwakeLength;
 use crate::hotkey::Hotkey;
 use crate::weather::Place;
 use crate::widgets::TimerStyle;
@@ -44,6 +45,8 @@ pub struct Settings {
     /// Where the weather is for: what the user typed, and the place it was found to be
     /// (`None` until looked up, or if nothing matched).
     pub place: Option<(String, Option<Place>)>,
+    /// How long keep awake stays on. (Whether it's on isn't saved: it always starts off.)
+    pub awake_length: AwakeLength,
 }
 
 impl Default for Settings {
@@ -60,6 +63,7 @@ impl Default for Settings {
             position: 0.5,
             hotkey: Some(Hotkey::DEFAULT),
             place: None,
+            awake_length: AwakeLength::default(),
         }
     }
 }
@@ -130,6 +134,7 @@ impl Settings {
                 // rather than quietly turning the shortcut off.
                 "hotkey" if value.is_empty() => s.hotkey = None,
                 "hotkey" => s.hotkey = Some(Hotkey::parse(value).unwrap_or(Hotkey::DEFAULT)),
+                "awake_length" => s.awake_length = AwakeLength::parse(value).unwrap_or_default(),
                 "style" => styled = value == STYLE,
                 "place" if !value.is_empty() => query = Some(value.to_string()),
                 "place_name" => name = Some(value.to_string()),
@@ -176,6 +181,7 @@ impl Settings {
             }
         }
         text += &format!("timer_style={}\n", self.timer_style.key());
+        text += &format!("awake_length={}\n", self.awake_length.key());
         text += &format!("style={STYLE}\n");
         text
     }
@@ -188,6 +194,7 @@ fn path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Settings;
+    use crate::awake::Length as AwakeLength;
     use crate::weather::Place;
     use crate::hotkey::Hotkey;
     use crate::widgets::TimerStyle;
@@ -206,6 +213,7 @@ mod tests {
             position: 0.3125,
             hotkey: Some(Hotkey { ctrl: true, alt: false, shift: true, win: false, vk: 0x4B }),
             place: Some(("02139".into(), Some(Place { name: "Cambridge, Massachusetts".into(), lat: 42.3751, lon: -71.10561 }))),
+            awake_length: AwakeLength::Minutes(135),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
         let apps = vec!["Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(), "Brave".to_string()];
@@ -219,6 +227,8 @@ mod tests {
         assert_eq!(Settings::parse(&s.serialize()), s, "a place not found yet keeps its query");
         let s = Settings { place: None, ..s };
         assert_eq!(Settings::parse(&s.serialize()), s);
+        let s = Settings { awake_length: AwakeLength::Forever, ..s };
+        assert_eq!(Settings::parse(&s.serialize()), s, "no limit");
     }
 
     #[test]
@@ -239,6 +249,7 @@ mod tests {
         assert_eq!(s, Settings { pinned: true, ..Settings::default() });
         assert_eq!(Settings::parse("color=1000000").color, Settings::default().color, "more than 24 bits");
         assert_eq!(Settings::parse("timer_style=plaid").timer_style, TimerStyle::default(), "a style from the future");
+        assert_eq!(Settings::parse("awake_length=soon").awake_length, AwakeLength::default());
     }
 
     #[test]

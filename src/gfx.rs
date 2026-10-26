@@ -536,6 +536,7 @@ pub mod glyph {
     pub const PALETTE: &str = "\u{E790}";
     pub const SEARCH: &str = "\u{E721}";
     pub const STOPWATCH: &str = "\u{E916}";
+    pub const EYE: &str = "\u{E890}";
 }
 
 /// The numerals face, Rajdhani 500, bundled into the executable.

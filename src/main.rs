@@ -2,6 +2,7 @@
 
 mod app;
 mod apps;
+mod awake;
 mod backdrop;
 mod clipboard;
 mod desktop;

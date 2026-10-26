@@ -3,6 +3,7 @@
 //! for the tab-row search.
 
 mod apps;
+mod awake;
 mod clipboard;
 mod clock;
 mod focus;
@@ -17,6 +18,7 @@ mod time;
 use std::rc::Rc;
 use std::time::Instant;
 
+use crate::awake::Awake;
 use crate::gfx::{Align, Canvas, Font, Ink, Rect, Rgb};
 use crate::motion;
 use crate::theme::{alpha, color, motion as timing, space};
@@ -302,17 +304,19 @@ pub trait Widget {
     }
 }
 
+pub use awake::{blinking as awake_blinking, rail_eye as awake_eye};
 pub use clock::{now_short, weather_icon};
 pub use styles::Style as TimerStyle;
 
-/// Every widget, in tab order. The Time tab shows `weather`.
-pub fn all(weather: &Rc<Weather>) -> Vec<Box<dyn Widget>> {
+/// Every widget, in tab order. The Time tab shows `weather`; the Awake tab switches `awake`.
+pub fn all(weather: &Rc<Weather>, awake: &Rc<Awake>) -> Vec<Box<dyn Widget>> {
     vec![
         Box::new(media::MediaWidget::new()),
         Box::new(time::TimeWidget::new(weather.clone())),
         Box::new(apps::AppsWidget::new()),
         Box::new(clipboard::ClipboardWidget::new()),
         Box::new(system::SystemWidget::new()),
+        Box::new(awake::AwakeWidget::new(awake.clone())),
     ]
 }
 

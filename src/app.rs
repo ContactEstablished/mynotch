@@ -14,6 +14,7 @@ use windows::{
         },
         Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
+        System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification},
         UI::{
             HiDpi::*,
             Input::KeyboardAndMouse::{
@@ -31,6 +32,7 @@ use windows::{
     core::*,
 };
 
+use crate::awake::Awake;
 use crate::backdrop::{self, Backdrop};
 use crate::clipboard;
 use crate::desktop::{self, autostart};
@@ -59,6 +61,7 @@ const CMD_PIN: usize = 1;
 const CMD_FULLSCREEN: usize = 2;
 const CMD_AUTOSTART: usize = 3;
 const CMD_QUIT: usize = 4;
+const CMD_AWAKE: usize = 5;
 
 // Logical (96-DPI) sizes.
 const COLLAPSED: (f32, f32) = (270.0, 32.0);
@@ -455,6 +458,8 @@ struct App {
     place_field: Option<TextField>,
     /// Local weather, for the Time tab; the place comes from Settings.
     weather: Rc<Weather>,
+    /// Keep awake: the Awake tab, the rail's eye and the menu's "Keep awake" all switch it.
+    awake: Rc<Awake>,
     /// Hold Right Ctrl to dictate; its recording strip takes the notch while you do.
     voice: Voice,
     /// 0..1: how far the collapsed notch has widened for the recording strip.
@@ -511,6 +516,8 @@ pub fn run() -> Result<()> {
 
         let mut app = App::new(hwnd)?;
         app.register_hotkey();
+        // Hear when the PC is locked and unlocked (WM_WTSSESSION_CHANGE), for keep awake.
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         app.render();
         app.refresh_icon(NIM_ADD);
         APP.with(|a| *a.borrow_mut() = Some(app));
@@ -546,7 +553,8 @@ impl App {
                 Some((query, None)) => Weather::spawn(None, Some(query)),
                 None => Weather::spawn(None, None),
             };
-            let mut widgets = widgets::all(&weather);
+            let awake = Rc::new(Awake::new());
+            let mut widgets = widgets::all(&weather, &awake);
             for w in &mut widgets {
                 w.load(&settings);
             }
@@ -583,6 +591,7 @@ impl App {
                 search: None,
                 place_field: None,
                 weather,
+                awake,
                 voice: Voice::start(),
                 voice_w: 0.0,
                 results: None,
@@ -1156,6 +1165,8 @@ impl App {
             self.settings.place = Some((query, Some(place)));
             self.settings.save();
         }
+        // Keep awake: its time running out, the battery running low, its F15 taps.
+        self.dirty |= self.awake.tick(now);
         // Voice: redraw when its strip changes. While it has the notch, it shows over a
         // fullscreen app too (the next fullscreen check hides it again afterwards).
         if self.voice.poll(now) {
@@ -1314,6 +1325,8 @@ impl App {
         }
         // The recording strip's dot breathes, or its light sweeps while transcribing.
         let voice = self.voice.animating().then_some(2);
+        // The rail's eye, while it blinks.
+        let eye = (self.t < 0.5 && self.awake.on() && widgets::awake_blinking()).then_some(1);
         let widgets = if self.t < 0.5 {
             self.compact().is_some_and(|(i, c)| c.live && self.widgets[i].animating()).then_some(2)
         } else {
@@ -1325,7 +1338,7 @@ impl App {
             };
             moving.then_some(1)
         };
-        voice.into_iter().chain(widgets).min()
+        voice.into_iter().chain(eye).chain(widgets).min()
     }
 
     /// Left button down at window-relative physical coordinates.
@@ -1699,9 +1712,24 @@ impl App {
             let degrees = format!("{:.0}°", report.temperature.round() + 0.0);
             x += 25.0 + cv.numerals(&[(degrees.as_str(), Font::Numeral, Ink::Dim)], x + 25.0, baseline, Align::Left);
         }
+        // Keep awake turned itself off: a closed eye, and why, in place of the readout.
+        let awake = self.awake.on();
+        if let Some(why) = self.awake.note(Instant::now()).filter(|_| !awake) {
+            widgets::awake_eye(cv, (x + 14.0, h / 2.0), 16.0, false);
+            cv.text(why.note(), Font::Small, Ink::Text, Rect::new(x + 26.0, 0.0, w - x - 42.0, h), Align::Left);
+            return;
+        }
+        // While keep awake is on, an open eye stands in for the separator.
+        if awake {
+            widgets::awake_eye(cv, (x + 12.0, h / 2.0), 16.0, true);
+        }
         let Some((i, compact)) = self.compact() else { return };
-        cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
-        let mut x = x + 18.0;
+        let mut x = if awake {
+            x + 24.0
+        } else {
+            cv.circle(x + 9.0, h / 2.0, 1.25, Ink::Dim, None);
+            x + 18.0
+        };
         if compact.live {
             // It breathes while a timer or stopwatch runs.
             let swell = if self.widgets[i].animating() && !motion::reduced() { motion::breath(2.0) } else { 0.6 };
@@ -1917,15 +1945,18 @@ fn tray_notify(hwnd: HWND, op: NOTIFY_ICON_MESSAGE, icon: HICON) {
 /// Shows the settings/quit menu at the cursor. `TrackPopupMenu` runs a modal loop, so this
 /// must be called without the `APP` borrow held, letting the frame timer keep animating.
 fn show_menu(hwnd: HWND, from_notch: bool) {
-    let mut settings = Settings::default();
+    let (mut settings, mut awake) = (Settings::default(), false);
     with_app(|a| {
         settings = a.settings.clone();
+        awake = a.awake.on();
         a.modal_open = from_notch;
     });
 
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, check(awake), CMD_AWAKE, w!("Keep awake"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, check(settings.pinned), CMD_PIN, w!("Pin open"));
         let _ = AppendMenuW(menu, check(settings.hide_in_fullscreen), CMD_FULLSCREEN, w!("Hide over fullscreen apps"));
         let _ = AppendMenuW(menu, check(autostart::enabled()), CMD_AUTOSTART, w!("Start with Windows"));
@@ -1952,6 +1983,10 @@ fn show_menu(hwnd: HWND, from_notch: bool) {
 
     with_app(|a| a.modal_open = false);
     match cmd {
+        CMD_AWAKE => with_app(|a| {
+            a.awake.toggle(Instant::now());
+            a.dirty = true;
+        }),
         CMD_PIN => with_app(|a| a.toggle_pin()),
         CMD_FULLSCREEN => with_app(|a| a.toggle_hide_in_fullscreen()),
         CMD_AUTOSTART => {
@@ -2101,8 +2136,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             });
             LRESULT(0)
         }
+        WM_WTSSESSION_CHANGE => {
+            match wparam.0 as u32 {
+                WTS_SESSION_LOCK => with_app(|a| a.awake.set_locked(true)),
+                WTS_SESSION_UNLOCK => with_app(|a| a.awake.set_locked(false)),
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe {
+                let _ = WTSUnRegisterSessionNotification(hwnd);
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
             }
             tray_notify(hwnd, NIM_DELETE, HICON::default());
